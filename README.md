@@ -1,6 +1,6 @@
 # ractor-supervisor
 
-A **pure-Rust** supervisor built atop the [`ractor`](https://docs.rs/ractor) framework. It provides OTP-style supervision trees so you can define how child actors should be restarted under different failure conditions, along with meltdown logic to prevent runaway restart loops.
+A **pure-Rust** supervisor built atop the [`ractor`](https://github.com/slawlor/ractor) framework. It provides OTP-style supervision trees so you can define how child actors should be restarted under different failure conditions, along with meltdown logic to prevent runaway restart loops.
 
 ## Overview
 
@@ -19,7 +19,7 @@ ractor-supervisor = "0.1"
 ractor = "0.14"
 ```
 
-To get started, you should already have familiarity with [`ractor`](https://docs.rs/ractor). This crate builds on top of `ractor`’s actor model.
+To get started, you should already have familiarity with [`ractor`](https://github.com/slawlor/ractor). This crate builds on top of `ractor`’s actor model.
 
 ## SupervisorOptions
 
@@ -176,4 +176,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## License
 
-This project is licensed under [MIT](LICENSE). It is heavily inspired by Elixir/Erlang OTP patterns, but implemented in pure Rust for the [`ractor`](https://docs.rs/ractor) framework
+This project is licensed under [MIT](LICENSE). It is heavily inspired by Elixir/Erlang OTP patterns, but implemented in pure Rust for the [`ractor`](https://github.com/slawlor/ractor) framework
