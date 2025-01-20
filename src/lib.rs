@@ -42,7 +42,7 @@
 //! ## Example
 //! ```rust
 //! use ractor::Actor;
-//! use ractor_supervisor::*; // assuming your crate is named ractor_supervisor
+//! use ractor_supervisor::*;
 //! use std::{time::Duration, sync::Arc};
 //! use tokio::time::Instant;
 //! use futures_util::FutureExt;
