@@ -15,7 +15,7 @@ A **pure-Rust** supervisor built atop the [`ractor`](https://github.com/slawlor/
 Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
-ractor-supervisor = "0.1.3"
+ractor-supervisor = "0.1.4"
 ractor = "0.14"
 ```
 

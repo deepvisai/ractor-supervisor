@@ -48,13 +48,13 @@
 //!
 //! With nested supervision, you can isolate failures and keep the rest of your system running.
 //!
-//! When creating supervisors ensure you use `Supervisor::spawn_linked` or `Supervisor::spawn` rather than the generic
-//! `Actor::spawn` methods to maintain proper supervision links.
+//! When creating supervisors ensure you use [`Supervisor::spawn_linked`] or [`Supervisor::spawn`] rather than the generic
+//! [`Actor::spawn`] methods to maintain proper supervision links.
 //!
 //! ## Usage
-//! 1. **Define** one or more child actors by implementing [`Actor`](ractor::Actor).
+//! 1. **Define** one or more child actors by implementing [`Actor`].
 //! 2. For each child, create a [`ChildSpec`] with:
-//!    - A [`Restart`](Restart) policy,
+//!    - A [`Restart`] policy,
 //!    - A `spawn_fn` that links the child to its supervisor,
 //!    - Optional `backoff_fn` / meltdown resets.
 //! 3. Configure [`SupervisorOptions`], specifying meltdown thresholds (`max_restarts`, `max_seconds`) and a supervision [`Strategy`].
@@ -394,7 +394,7 @@ impl SupervisorState {
 
     /// Called when a child terminates or fails.  
     /// - If `abnormal == true`, we treat it like a panic or error exit.  
-    /// - If the child’s [`Restart`](Restart) policy indicates a restart is needed, we do it.  
+    /// - If the child’s [`Restart`] policy indicates a restart is needed, we do it.  
     ///
     /// Returns `Some(child_id)` if the supervisor should re-spawn the child, or `None` otherwise.
     pub fn handle_child_exit(
