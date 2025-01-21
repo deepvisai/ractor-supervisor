@@ -13,6 +13,13 @@
 //! - **OneForAll**: If any child fails, all children are stopped and restarted.
 //! - **RestForOne**: The failing child and all subsequent children (as defined in order) are stopped and restarted.
 //!
+//! Strategies apply to **all failure scenarios**, including:
+//! - Spawn errors (failures in `pre_start`/`post_start`)
+//! - Runtime panics
+//! - Normal and abnormal exits
+//!
+//! Example: If spawning a child fails during pre_start, it will count as a restart and trigger strategy logic
+//!
 //! ### Restart Policies
 //! - **Permanent**: Always restart, no matter how the child exited.
 //! - **Transient**: Restart only if the child exited abnormally (panic or error).
@@ -26,6 +33,24 @@
 //! - **`restart_counter_reset_after`** (per child): If a specific child remains up for that many seconds, its own failure count is reset to zero on the next failure.
 //! - **`backoff_fn`**: An optional function to delay a child’s restart. For instance, you might implement exponential backoff to prevent immediate thrashing restarts.
 //!
+//! ## Multi-Level Supervision Trees
+//!
+//! Supervisors can manage other **supervisors** as children, forming a **hierarchical** or **tree** structure. This way, different subsystems can each have their own meltdown thresholds or strategies. A meltdown in one subtree doesn’t necessarily mean the entire application must go down, unless the top-level supervisor is triggered.
+//!
+//! For example, you might have:
+//! - **Root Supervisor** (OneForOne)
+//!   - **Sub-supervisor A** (OneForAll)
+//!     - Child actor #1
+//!     - Child actor #2
+//!   - **Sub-supervisor B** (RestForOne)
+//!     - Child actor #3
+//!     - Child actor #4
+//!
+//! With nested supervision, you can isolate failures and keep the rest of your system running.
+//!
+//! When creating supervisors ensure you use `Supervisor::spawn_linked` or `Supervisor::spawn` rather than the generic
+//! `Actor::spawn` methods to maintain proper supervision links.
+//!
 //! ## Usage
 //! 1. **Define** one or more child actors by implementing [`Actor`](ractor::Actor).
 //! 2. For each child, create a [`ChildSpec`] with:
@@ -33,11 +58,7 @@
 //!    - A `spawn_fn` that links the child to its supervisor,
 //!    - Optional `backoff_fn` / meltdown resets.
 //! 3. Configure [`SupervisorOptions`], specifying meltdown thresholds (`max_restarts`, `max_seconds`) and a supervision [`Strategy`].
-//! 4. Pass those into [`SupervisorArguments`] and **spawn** your [`Supervisor`] via `Actor::spawn(...)`.
-//!
-//! You can also nest supervisors to build **multi-level supervision trees**—simply treat a supervisor as a “child” of another supervisor by specifying its own `ChildSpec`. This structure allows you to partition failure domains and maintain more complex actor systems in a structured, fault-tolerant manner.
-//!
-//! If meltdown conditions are reached, the supervisor stops itself abnormally to prevent runaway restart loops.
+//! 4. Pass those into [`SupervisorArguments`] and **spawn** your [`Supervisor`] via `Supervisor::spawn(...)`.
 //!
 //! ## Example
 //! ```rust
@@ -134,8 +155,8 @@
 //!     };
 //!
 //!     // Spawn the supervisor with our arguments.
-//!     let (sup_ref, sup_handle) = Actor::spawn(
-//!         None,        // no name for the supervisor
+//!     let (sup_ref, sup_handle) = Supervisor::spawn(
+//!         "root".into(), // name for the supervisor
 //!         Supervisor,  // the Supervisor actor
 //!         args
 //!     ).await?;
@@ -147,9 +168,10 @@
 //! }
 //! ```
 use if_chain::if_chain;
-use ractor::concurrency::sleep;
+use ractor::concurrency::{sleep, JoinHandle};
 use ractor::{
-    Actor, ActorCell, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr, SupervisionEvent,
+    Actor, ActorCell, ActorId, ActorName, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr,
+    SupervisionEvent,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -186,6 +208,10 @@ pub enum Strategy {
 ///
 /// - If more than `max_restarts` occur within `max_seconds`, meltdown occurs (supervisor stops abnormally).
 /// - If `restart_counter_reset_after` is set, we clear the meltdown log if no restarts occur in that span.
+///
+/// # Timing
+/// - `max_seconds`: Meltdown tracking window duration in **seconds**  
+/// - `restart_counter_reset_after`: Supervisor-level reset duration in **seconds**
 pub struct SupervisorOptions {
     /// One of OneForOne, OneForAll, or RestForOne
     pub strategy: Strategy,
@@ -212,12 +238,19 @@ pub type ChildBackoffFn =
 /// The future returned by a [`SpawnFn`].
 pub type SpawnFuture = Pin<Box<dyn Future<Output = Result<ActorCell, SpawnErr>> + Send>>;
 
-/// User-provided closure to spawn a child. You typically call `Actor::spawn_linked` here.
+/// User-provided closure to spawn a child. You typically call `Supervisor::spawn_linked` here.
 pub type SpawnFn = Box<dyn Fn(ActorCell, String) -> SpawnFuture + Send + Sync>;
 
 /// Defines how to spawn and manage a single child actor.
 pub struct ChildSpec {
-    /// Unique child ID string (for logging, meltdown log, etc.).
+    /// Unique child ID string that **must be provided**. This will be used as:
+    /// 1. The actor's global registry name
+    /// 2. Key for failure tracking
+    /// 3. Child specification identifier
+    ///
+    /// # Important
+    /// This ID must be unique within the supervisor's child list and will be
+    /// used to register the actor in the global registry via [`ractor::registry`].
     pub id: String,
 
     /// Restart policy for this child. [`Restart::Permanent`], [`Restart::Transient`], [`Restart::Temporary`].
@@ -233,6 +266,9 @@ pub struct ChildSpec {
     /// we reset *this child’s* failure count to 0 next time it fails.  
     ///
     /// This is **separate** from the supervisor-level meltdown logic in [`SupervisorOptions`].
+    ///
+    /// # Units
+    /// Specified in **seconds** as a `u64` value.
     pub restart_counter_reset_after: Option<u64>,
 }
 
@@ -269,6 +305,9 @@ pub enum SupervisorError {
     #[error("Child '{child_id}' not found in specs")]
     ChildNotFound { child_id: String },
 
+    #[error("Child '{pid}' does not have a name set")]
+    ChildNameNotSet { pid: ActorId },
+
     #[error("Meltdown: too many restarts => meltdown")]
     Meltdown,
 
@@ -284,12 +323,13 @@ pub struct RestartLog {
 }
 
 /// Holds the supervisor’s live state: which children are running, how many times each child has failed, etc.
+///
+/// # Important
+/// The `child_specs` vector maintains the **startup order** of children which is critical for
+/// strategies like `RestForOne` that rely on child ordering.
 pub struct SupervisorState {
     /// The original child specs (each child’s config).
     pub child_specs: Vec<ChildSpec>,
-
-    /// The currently running children: `child_id -> ActorCell`.
-    pub running: HashMap<String, ActorCell>,
 
     /// Tracks how many times each child has failed and the last time it failed.
     pub child_failure_state: HashMap<String, ChildFailureState>,
@@ -302,10 +342,9 @@ pub struct SupervisorState {
 }
 
 /// A snapshot of the supervisor’s state, used mainly for testing or debugging.  
-/// Contains copies of the supervisor’s “running” children, child failure counters, and meltdown log.
+/// Contains copies of the supervisor’s child failure counters, and meltdown log.
 #[derive(Clone)]
 pub struct InspectableState {
-    pub running: HashMap<String, ActorCell>,
     pub child_failure_state: HashMap<String, ChildFailureState>,
     pub restart_log: Vec<RestartLog>,
 }
@@ -315,40 +354,19 @@ impl SupervisorState {
     fn new(args: SupervisorArguments) -> Self {
         Self {
             child_specs: args.child_specs,
-            running: HashMap::new(),
             child_failure_state: HashMap::new(),
             restart_log: Vec::new(),
             options: args.options,
         }
     }
 
-    /// Spawn all children in the order they were defined in [`SupervisorArguments::child_specs`].
-    pub async fn spawn_all_children(
-        &mut self,
-        supervisor_cell: ActorCell,
-    ) -> Result<(), ActorProcessingErr> {
-        for spec in &self.child_specs {
-            let child = (spec.spawn_fn)(supervisor_cell.clone(), spec.id.clone())
-                .await
-                .map_err(|e| SupervisorError::SpawnError {
-                    child_id: spec.id.clone(),
-                    source: e,
-                })?;
-            self.running.insert(spec.id.clone(), child);
-            // Initialize child_failure_state for each child
-            self.child_failure_state
-                .entry(spec.id.clone())
-                .or_insert_with(|| ChildFailureState {
-                    restart_count: 0,
-                    last_fail_instant: Instant::now(),
-                });
-        }
-        Ok(())
-    }
-
     /// Increments the failure count for a given child.  
     /// Resets the child’s `restart_count` to 0 if the time since last fail >= child’s `restart_counter_reset_after`.
-    pub fn prepare_child_failure(&mut self, child_id: &str) -> Result<(), ActorProcessingErr> {
+    pub fn prepare_child_failure(
+        &mut self,
+        child_spec: &ChildSpec,
+    ) -> Result<(), ActorProcessingErr> {
+        let child_id = &child_spec.id;
         let now = Instant::now();
         let entry = self
             .child_failure_state
@@ -358,14 +376,7 @@ impl SupervisorState {
                 last_fail_instant: now,
             });
 
-        let child_reset_after = self
-            .child_specs
-            .iter()
-            .find(|s| s.id == child_id)
-            .ok_or(SupervisorError::ChildNotFound {
-                child_id: child_id.to_string(),
-            })?
-            .restart_counter_reset_after;
+        let child_reset_after = child_spec.restart_counter_reset_after;
 
         if let Some(threshold_secs) = child_reset_after {
             let elapsed = now.duration_since(entry.last_fail_instant).as_secs();
@@ -381,36 +392,17 @@ impl SupervisorState {
         Ok(())
     }
 
-    /// Return the child ID for a given [ActorCell], if it’s in the `running` map.
-    pub fn get_child_id_by_cell_id(&self, cell_id: ractor::ActorId) -> Option<String> {
-        self.running.iter().find_map(|(id, c)| {
-            if c.get_id() == cell_id {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
-    }
-
     /// Called when a child terminates or fails.  
     /// - If `abnormal == true`, we treat it like a panic or error exit.  
-    /// - We remove the child from `running`.  
     /// - If the child’s [`Restart`](Restart) policy indicates a restart is needed, we do it.  
     ///
     /// Returns `Some(child_id)` if the supervisor should re-spawn the child, or `None` otherwise.
     pub fn handle_child_exit(
         &mut self,
-        child_id: &str,
+        child_spec: &ChildSpec,
         abnormal: bool,
-    ) -> Result<Option<String>, ActorProcessingErr> {
-        self.running.remove(child_id);
-
-        let spec = self.child_specs.iter().find(|s| s.id == child_id).ok_or(
-            SupervisorError::ChildNotFound {
-                child_id: child_id.to_string(),
-            },
-        )?;
-        let policy = spec.restart;
+    ) -> Result<bool, ActorProcessingErr> {
+        let policy = child_spec.restart;
 
         // Should we restart this child?
         let should_restart = match policy {
@@ -420,27 +412,37 @@ impl SupervisorState {
         };
 
         if should_restart {
-            self.prepare_child_failure(child_id)?;
-            Ok(Some(child_id.to_owned()))
-        } else {
-            // Child does not restart
-            Ok(None)
+            self.prepare_child_failure(child_spec)?;
         }
+
+        Ok(should_restart)
+    }
+
+    /// Called when a child exits abnormally or normally.
+    /// - If the child should be restarted, we schedule a future spawn for it.
+    /// - If the supervisor should meltdown, we return an error to end abnormally.
+    fn handle_child_restart(
+        &mut self,
+        child_spec: &ChildSpec,
+        abnormal: bool,
+        myself: ActorRef<SupervisorMsg>,
+    ) -> Result<(), ActorProcessingErr> {
+        if self.handle_child_exit(child_spec, abnormal)? {
+            self.schedule_restart(child_spec, self.options.strategy, myself.clone())?;
+        }
+
+        Ok(())
     }
 
     /// Schedule a future spawn for a child, respecting any child-level `backoff_fn`.
     pub fn schedule_restart(
         &mut self,
-        child_id: &String,
+        child_spec: &ChildSpec,
         strategy: Strategy,
         myself: ActorRef<SupervisorMsg>,
     ) -> Result<(), ActorProcessingErr> {
+        let child_id = &child_spec.id;
         let st = &self.child_failure_state[child_id];
-        let spec = self.child_specs.iter().find(|s| s.id == *child_id).ok_or(
-            SupervisorError::ChildNotFound {
-                child_id: child_id.clone(),
-            },
-        )?;
 
         let spawn_msg = match strategy {
             Strategy::OneForOne => SupervisorMsg::OneForOneSpawn {
@@ -455,12 +457,12 @@ impl SupervisorState {
         };
 
         // If the child has a backoff function, compute the optional delay
-        let maybe_delay = spec.backoff_fn.as_ref().and_then(|cb| {
+        let maybe_delay = child_spec.backoff_fn.as_ref().and_then(|cb| {
             (cb)(
                 child_id,
                 st.restart_count,
                 st.last_fail_instant,
-                spec.restart_counter_reset_after,
+                child_spec.restart_counter_reset_after,
             )
         });
 
@@ -513,22 +515,59 @@ impl SupervisorState {
         Ok(())
     }
 
+    pub async fn spawn_child(
+        &mut self,
+        child_spec: &ChildSpec,
+        myself: ActorRef<SupervisorMsg>,
+    ) -> Result<(), ActorProcessingErr> {
+        let result = (child_spec.spawn_fn)(myself.get_cell().clone(), child_spec.id.clone())
+            .await
+            .map_err(|e| SupervisorError::SpawnError {
+                child_id: child_spec.id.clone(),
+                source: e,
+            });
+
+        // Important: Spawn failures (including pre_start errors)
+        // trigger restart logic and meltdown checks
+        if let Err(_err) = result {
+            self.handle_child_restart(child_spec, true, myself.clone())?;
+        }
+
+        Ok(())
+    }
+
+    /// Spawn all children in the order they were defined in [`SupervisorArguments::child_specs`].
+    pub async fn spawn_all_children(
+        &mut self,
+        myself: ActorRef<SupervisorMsg>,
+    ) -> Result<(), ActorProcessingErr> {
+        // Temporarily take ownership of child_specs to avoid holding an immutable borrow
+        let child_specs = std::mem::take(&mut self.child_specs);
+        for spec in &child_specs {
+            self.spawn_child(spec, myself.clone()).await?;
+        }
+
+        // Restore the child_specs after spawning
+        self.child_specs = child_specs;
+        Ok(())
+    }
+
     /// OneForOne: meltdown-check first, then spawn just the failing child.
     pub async fn perform_one_for_one_spawn(
         &mut self,
         child_id: &str,
-        supervisor_cell: ActorCell,
+        myself: ActorRef<SupervisorMsg>,
     ) -> Result<(), ActorProcessingErr> {
         self.track_global_restart(child_id)?;
-        if let Some(spec) = self.child_specs.iter().find(|s| s.id == child_id) {
-            let new_child = (spec.spawn_fn)(supervisor_cell, spec.id.clone())
-                .await
-                .map_err(|e| SupervisorError::SpawnError {
-                    child_id: spec.id.clone(),
-                    source: e,
-                })?;
-            self.running.insert(child_id.to_string(), new_child);
+
+        // Temporarily take ownership of child_specs to avoid holding an immutable borrow
+        let child_specs = std::mem::take(&mut self.child_specs);
+        if let Some(spec) = child_specs.iter().find(|s| s.id == child_id) {
+            self.spawn_child(spec, myself.clone()).await?;
         }
+
+        // Restore the child_specs after spawning
+        self.child_specs = child_specs;
         Ok(())
     }
 
@@ -537,20 +576,19 @@ impl SupervisorState {
         &mut self,
         child_id: &str,
         myself: ActorRef<SupervisorMsg>,
-        supervisor_cell: ActorCell,
     ) -> Result<(), ActorProcessingErr> {
         self.track_global_restart(child_id)?;
 
         // Kill all children. Must unlink to prevent confusion with them receiving further messages.
-        for (_, cell) in self.running.drain() {
+        for cell in myself.get_children() {
             cell.unlink(myself.get_cell());
             cell.kill();
         }
 
         // A short delay to allow the old children to fully unregister (avoid name collisions).
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(10)).await;
 
-        self.spawn_all_children(supervisor_cell).await?;
+        self.spawn_all_children(myself).await?;
         Ok(())
     }
 
@@ -559,33 +597,37 @@ impl SupervisorState {
         &mut self,
         child_id: &str,
         myself: ActorRef<SupervisorMsg>,
-        supervisor_cell: ActorCell,
     ) -> Result<(), ActorProcessingErr> {
         self.track_global_restart(child_id)?;
 
-        if let Some(i) = self.child_specs.iter().position(|s| s.id == child_id) {
+        // Temporarily take ownership of child_specs to avoid holding an immutable borrow
+        let child_specs = std::mem::take(&mut self.child_specs);
+        let children = myself.get_children();
+        let child_cell_by_name: HashMap<String, &ActorCell> = children
+            .iter()
+            .filter_map(|cell| cell.get_name().map(|name| (name, cell)))
+            .collect();
+
+        if let Some(i) = child_specs.iter().position(|s| s.id == child_id) {
             // Kill children from i..end
-            for spec in self.child_specs.iter().skip(i) {
-                if let Some(cell) = self.running.remove(&spec.id) {
+            for spec in child_specs.iter().skip(i) {
+                if let Some(cell) = child_cell_by_name.get(&spec.id) {
                     cell.unlink(myself.get_cell());
                     cell.kill();
                 }
             }
 
             // Short delay so old names get unregistered
-            sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(10)).await;
 
             // Re-spawn children from i..end
-            for spec in self.child_specs.iter().skip(i) {
-                let new_child = (spec.spawn_fn)(supervisor_cell.clone(), spec.id.clone())
-                    .await
-                    .map_err(|e| SupervisorError::SpawnError {
-                        child_id: spec.id.clone(),
-                        source: e,
-                    })?;
-                self.running.insert(spec.id.clone(), new_child);
+            for spec in child_specs.iter().skip(i) {
+                self.spawn_child(spec, myself.clone()).await?;
             }
         }
+
+        // Restore the child_specs after spawning
+        self.child_specs = child_specs;
         Ok(())
     }
 }
@@ -595,10 +637,30 @@ impl SupervisorState {
 /// If meltdown occurs, it returns an error to end abnormally (thus skipping `post_stop`).
 pub struct Supervisor;
 
+impl Supervisor {
+    pub async fn spawn_linked<T: Actor>(
+        name: ActorName,
+        handler: T,
+        startup_args: T::Arguments,
+        supervisor: ActorCell,
+    ) -> Result<(ActorRef<T::Msg>, JoinHandle<()>), SpawnErr> {
+        Actor::spawn_linked(Some(name), handler, startup_args, supervisor).await
+    }
+
+    pub async fn spawn<T: Actor>(
+        name: ActorName,
+        handler: T,
+        startup_args: T::Arguments,
+    ) -> Result<(ActorRef<T::Msg>, JoinHandle<()>), SpawnErr> {
+        Actor::spawn(Some(name), handler, startup_args).await
+    }
+}
+
 /// A global map for test usage, storing final states after each handle call and in `post_stop`.
 #[cfg(test)]
-static SUPERVISOR_FINAL: std::sync::OnceLock<std::sync::Mutex<HashMap<String, InspectableState>>> =
-    std::sync::OnceLock::new();
+static SUPERVISOR_FINAL: std::sync::OnceLock<
+    tokio::sync::Mutex<HashMap<String, InspectableState>>,
+> = std::sync::OnceLock::new();
 
 #[ractor::async_trait]
 impl Actor for Supervisor {
@@ -619,9 +681,8 @@ impl Actor for Supervisor {
         myself: ActorRef<Self::Msg>,
         state: &mut SupervisorState,
     ) -> Result<(), ActorProcessingErr> {
-        let supervisor_cell = myself.get_cell();
         // Spawn all children initially
-        state.spawn_all_children(supervisor_cell).await?;
+        state.spawn_all_children(myself).await?;
         Ok(())
     }
 
@@ -633,26 +694,24 @@ impl Actor for Supervisor {
         msg: SupervisorMsg,
         state: &mut SupervisorState,
     ) -> Result<(), ActorProcessingErr> {
-        let supervisor_cell = myself.get_cell();
         let result = match msg {
             SupervisorMsg::OneForOneSpawn { child_id } => {
                 state
-                    .perform_one_for_one_spawn(&child_id, supervisor_cell)
+                    .perform_one_for_one_spawn(&child_id, myself.clone())
                     .await
             }
             SupervisorMsg::OneForAllSpawn { child_id } => {
                 state
-                    .perform_one_for_all_spawn(&child_id, myself.clone(), supervisor_cell)
+                    .perform_one_for_all_spawn(&child_id, myself.clone())
                     .await
             }
             SupervisorMsg::RestForOneSpawn { child_id } => {
                 state
-                    .perform_rest_for_one_spawn(&child_id, myself.clone(), supervisor_cell)
+                    .perform_rest_for_one_spawn(&child_id, myself.clone())
                     .await
             }
             SupervisorMsg::InspectState(rpc_reply_port) => {
                 let snap = InspectableState {
-                    running: state.running.clone(),
                     child_failure_state: state.child_failure_state.clone(),
                     restart_log: state.restart_log.clone(),
                 };
@@ -662,7 +721,9 @@ impl Actor for Supervisor {
         };
 
         #[cfg(test)]
-        store_final_state(myself, state);
+        {
+            store_final_state(myself, state).await;
+        }
 
         // Return any meltdown or spawn error
         result
@@ -678,27 +739,42 @@ impl Actor for Supervisor {
         state: &mut SupervisorState,
     ) -> Result<(), ActorProcessingErr> {
         match evt {
-            SupervisionEvent::ActorStarted(_child_ref) => { /* ignore for now */ }
+            SupervisionEvent::ActorStarted(cell) => {
+                let child_id = cell
+                    .get_name()
+                    .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
+
+                // Initialize child_failure_state if not present
+                state
+                    .child_failure_state
+                    .entry(child_id)
+                    .or_insert_with(|| ChildFailureState {
+                        restart_count: 0,
+                        last_fail_instant: tokio::time::Instant::now(),
+                    });
+            }
             SupervisionEvent::ActorTerminated(cell, _final_state, _reason) => {
                 // Normal exit => abnormal=false
-                if_chain! {
-                    if let Some(child_id) = state.get_child_id_by_cell_id(cell.get_id());
-                    if let Some(restart_id) = state.handle_child_exit(&child_id, false)?;
-                    then {
-                        state.schedule_restart(&restart_id, state.options.strategy, myself.clone())?;
-                    }
+                let child_id = cell
+                    .get_name()
+                    .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
+                let child_specs = std::mem::take(&mut state.child_specs);
+                if let Some(spec) = child_specs.iter().find(|s| s.id == child_id) {
+                    state.handle_child_restart(spec, false, myself.clone())?;
                 }
+                state.child_specs = child_specs;
             }
             SupervisionEvent::ProcessGroupChanged(_group) => {}
             SupervisionEvent::ActorFailed(cell, _reason) => {
                 // Abnormal exit => abnormal=true
-                if_chain! {
-                    if let Some(child_id) = state.get_child_id_by_cell_id(cell.get_id());
-                    if let Some(restart_id) = state.handle_child_exit(&child_id, true)?;
-                    then {
-                        state.schedule_restart(&restart_id, state.options.strategy, myself.clone())?;
-                    }
+                let child_id = cell
+                    .get_name()
+                    .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
+                let child_specs = std::mem::take(&mut state.child_specs);
+                if let Some(spec) = child_specs.iter().find(|s| s.id == child_id) {
+                    state.handle_child_restart(spec, true, myself.clone())?;
                 }
+                state.child_specs = child_specs;
             }
         }
         Ok(())
@@ -712,22 +788,23 @@ impl Actor for Supervisor {
         _state: &mut SupervisorState,
     ) -> Result<(), ActorProcessingErr> {
         #[cfg(test)]
-        store_final_state(_myself, _state);
+        {
+            store_final_state(_myself, _state).await;
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
-fn store_final_state(myself: ActorRef<SupervisorMsg>, state: &SupervisorState) {
+async fn store_final_state(myself: ActorRef<SupervisorMsg>, state: &SupervisorState) {
     let mut map = SUPERVISOR_FINAL
-        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
         .lock()
-        .unwrap();
+        .await;
     if let Some(name) = myself.get_name() {
         map.insert(
             name,
             InspectableState {
-                running: state.running.clone(),
                 child_failure_state: state.child_failure_state.clone(),
                 restart_log: state.restart_log.clone(),
             },
@@ -746,15 +823,15 @@ mod tests {
 
     #[cfg(test)]
     static ACTOR_CALL_COUNT: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, u64>>,
+        tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
     > = std::sync::OnceLock::new();
 
-    fn before_each() {
+    async fn before_each() {
         // Clear the final supervisor state map (test usage)
         match super::SUPERVISOR_FINAL.get() {
             None => {}
             Some(map) => {
-                let mut map = map.lock().unwrap();
+                let mut map = map.lock().await;
                 map.clear();
             }
         }
@@ -762,39 +839,41 @@ mod tests {
         match ACTOR_CALL_COUNT.get() {
             None => {}
             Some(map) => {
-                let mut map = map.lock().unwrap();
+                let mut map = map.lock().await;
                 map.clear();
             }
         }
+
+        sleep(Duration::from_millis(10)).await;
     }
 
-    fn increment_actor_count(child_id: &str) {
+    async fn increment_actor_count(child_id: &str) {
         let mut map = ACTOR_CALL_COUNT
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
             .lock()
-            .unwrap();
+            .await;
         *map.entry(child_id.to_string()).or_default() += 1;
     }
 
     /// Utility to read the final state of a named supervisor after it stops.
-    fn read_final_supervisor_state(sup_name: &str) -> InspectableState {
+    async fn read_final_supervisor_state(sup_name: &str) -> InspectableState {
         let map = super::SUPERVISOR_FINAL
             .get()
             .expect("SUPERVISOR_FINAL not initialized!")
             .lock()
-            .unwrap();
+            .await;
 
         map.get(sup_name)
             .cloned()
             .unwrap_or_else(|| panic!("No final state for supervisor '{sup_name}'"))
     }
 
-    fn read_actor_call_count(child_id: &str) -> u64 {
+    async fn read_actor_call_count(child_id: &str) -> u64 {
         let map = ACTOR_CALL_COUNT
             .get()
             .expect("ACTOR_CALL_COUNT not initialized!")
             .lock()
-            .unwrap();
+            .await;
 
         *map.get(child_id)
             .unwrap_or_else(|| panic!("No actor call count for child '{child_id}'"))
@@ -838,21 +917,14 @@ mod tests {
             arg: Self::Arguments,
         ) -> Result<Self::State, ractor::ActorProcessingErr> {
             // Track how many times this particular child-id was started
-            increment_actor_count(myself.get_name().unwrap().as_str());
-            Ok(arg)
-        }
+            increment_actor_count(myself.get_name().unwrap().as_str()).await;
 
-        async fn post_start(
-            &self,
-            myself: ActorRef<Self::Msg>,
-            state: &mut Self::State,
-        ) -> Result<(), ractor::ActorProcessingErr> {
-            match state {
+            match arg {
                 ChildBehavior::DelayedFail { ms } => {
-                    myself.send_after(Duration::from_millis(*ms), || ());
+                    myself.send_after(Duration::from_millis(ms), || ());
                 }
                 ChildBehavior::DelayedNormal { ms } => {
-                    myself.send_after(Duration::from_millis(*ms), || ());
+                    myself.send_after(Duration::from_millis(ms), || ());
                 }
                 ChildBehavior::ImmediateFail => {
                     panic!("Immediate fail => ActorFailed");
@@ -861,14 +933,14 @@ mod tests {
                     myself.stop(None);
                 }
                 ChildBehavior::CountedFails { delay_ms, .. } => {
-                    myself.send_after(Duration::from_millis(*delay_ms), || ());
+                    myself.send_after(Duration::from_millis(delay_ms), || ());
                 }
                 ChildBehavior::FailWaitFail { .. } => {
                     // Kick off our chain of fails by sending a first message
                     myself.cast(())?;
                 }
             }
-            Ok(())
+            Ok(arg)
         }
 
         async fn handle(
@@ -925,12 +997,18 @@ mod tests {
         }
     }
 
-    fn get_running_children(sup_ref: &ActorRef<SupervisorMsg>) -> Vec<ActorCell> {
+    fn get_running_children(sup_ref: &ActorRef<SupervisorMsg>) -> HashMap<String, ActorCell> {
         sup_ref
             .get_children()
             .into_iter()
-            .filter(|c| c.get_status() == ActorStatus::Running)
-            .collect::<Vec<_>>()
+            .filter_map(|c| {
+                if c.get_status() == ActorStatus::Running {
+                    c.get_name().map(|n| (n, c))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     // Helper for spawning our test child
@@ -939,7 +1017,7 @@ mod tests {
         id: String,
         behavior: ChildBehavior,
     ) -> Result<ActorCell, SpawnErr> {
-        let (ch_ref, _join) = Actor::spawn_linked(Some(id), TestChild, behavior, sup_cell).await?;
+        let (ch_ref, _join) = Supervisor::spawn_linked(id, TestChild, behavior, sup_cell).await?;
         Ok(ch_ref.get_cell())
     }
 
@@ -958,7 +1036,7 @@ mod tests {
 
     #[ractor::concurrency::test]
     async fn test_permanent_delayed_fail() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // meltdown on the 2nd fail => max_restarts=1
         let child_spec = make_child_spec(
@@ -978,11 +1056,12 @@ mod tests {
         };
 
         let (sup_ref, sup_handle) =
-            Actor::spawn(Some("test_permanent_delayed_fail".into()), Supervisor, args).await?;
+            Supervisor::spawn("test_permanent_delayed_fail".into(), Supervisor, args).await?;
 
         sleep(Duration::from_millis(100)).await;
         let st = call_t!(sup_ref, SupervisorMsg::InspectState, 500).unwrap();
-        assert_eq!(st.running.len(), 1);
+        let mut running = get_running_children(&sup_ref);
+        assert_eq!(running.len(), 1);
         assert_eq!(st.restart_log.len(), 0);
 
         // meltdown on second fail => wait for supervisor to stop
@@ -990,19 +1069,20 @@ mod tests {
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
 
         // final checks
-        let final_st = read_final_supervisor_state("test_permanent_delayed_fail");
-        assert_eq!(final_st.running.len(), 0);
+        let final_st = read_final_supervisor_state("test_permanent_delayed_fail").await;
+        running = get_running_children(&sup_ref);
+        assert_eq!(running.len(), 0);
         assert!(final_st.restart_log.len() >= 2);
 
         // We had exactly 2 spawns: one initial, one after 1st fail => meltdown on 2nd fail
-        assert_eq!(read_actor_call_count("fail-delay"), 2);
+        assert_eq!(read_actor_call_count("fail-delay").await, 2);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_transient_delayed_normal() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // child does a delayed normal exit => no restarts
         let child_spec = make_child_spec(
@@ -1021,16 +1101,14 @@ mod tests {
             options,
         };
 
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_transient_delayed_normal".into()),
-            Supervisor,
-            args,
-        )
-        .await?;
+        let (sup_ref, sup_handle) =
+            Supervisor::spawn("test_transient_delayed_normal".into(), Supervisor, args).await?;
 
         sleep(Duration::from_millis(150)).await;
         let st1 = call_t!(sup_ref, SupervisorMsg::InspectState, 500).unwrap();
-        assert_eq!(st1.running.len(), 1);
+
+        let mut running = get_running_children(&sup_ref);
+        assert_eq!(running.len(), 1);
         assert_eq!(st1.restart_log.len(), 0);
 
         // child exits normally => no meltdown => we stop
@@ -1038,19 +1116,20 @@ mod tests {
         sup_ref.stop(None);
         let _ = sup_handle.await;
 
-        let final_state = read_final_supervisor_state("test_transient_delayed_normal");
-        assert!(!final_state.running.contains_key("normal-delay"));
+        let final_state = read_final_supervisor_state("test_transient_delayed_normal").await;
+        running = get_running_children(&sup_ref);
+        assert!(!running.contains_key("normal-delay"));
         assert_eq!(final_state.restart_log.len(), 0);
 
         // Only ever spawned once
-        assert_eq!(read_actor_call_count("normal-delay"), 1);
+        assert_eq!(read_actor_call_count("normal-delay").await, 1);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_temporary_delayed_fail() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // Temporary => never restart even if fails
         let child_spec = make_child_spec(
@@ -1070,11 +1149,12 @@ mod tests {
         };
 
         let (sup_ref, sup_handle) =
-            Actor::spawn(Some("test_temporary_delayed_fail".into()), Supervisor, args).await?;
+            Supervisor::spawn("test_temporary_delayed_fail".into(), Supervisor, args).await?;
 
         sleep(Duration::from_millis(100)).await;
         let st1 = call_t!(sup_ref, SupervisorMsg::InspectState, 500).unwrap();
-        assert_eq!(st1.running.len(), 1);
+        let mut running = get_running_children(&sup_ref);
+        assert_eq!(running.len(), 1);
         assert_eq!(st1.restart_log.len(), 0);
 
         // The child fails, but policy=Temporary => no restart
@@ -1084,19 +1164,20 @@ mod tests {
         sup_ref.stop(None);
         let _ = sup_handle.await;
 
-        let final_state = read_final_supervisor_state("test_temporary_delayed_fail");
-        assert_eq!(final_state.running.len(), 0);
+        let final_state = read_final_supervisor_state("test_temporary_delayed_fail").await;
+        running = get_running_children(&sup_ref);
+        assert_eq!(running.len(), 0);
         assert_eq!(final_state.restart_log.len(), 0);
 
         // Only ever spawned once
-        assert_eq!(read_actor_call_count("temp-delay"), 1);
+        assert_eq!(read_actor_call_count("temp-delay").await, 1);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_one_for_all_stop_all_on_failure() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // meltdown on the 3rd fail => set max_restarts=2 => meltdown at fail #3
         let child1 = make_child_spec(
@@ -1120,8 +1201,8 @@ mod tests {
             child_specs: vec![child1, child2],
             options,
         };
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_one_for_all_stop_all_on_failure".into()),
+        let (sup_ref, sup_handle) = Supervisor::spawn(
+            "test_one_for_all_stop_all_on_failure".into(),
             Supervisor,
             args,
         )
@@ -1134,22 +1215,22 @@ mod tests {
         let _ = sup_handle.await;
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
 
-        let final_state = read_final_supervisor_state("test_one_for_all_stop_all_on_failure");
+        let final_state = read_final_supervisor_state("test_one_for_all_stop_all_on_failure").await;
         assert_eq!(sup_ref.get_children().len(), 0);
         assert_eq!(final_state.restart_log.len(), 3);
 
         // Because each time "ofa-fail" fails, OneForAll restarts *all* children:
         // meltdown occurs on the 3rd fail => that means "ofa-fail" was spawned 3 times
-        assert_eq!(read_actor_call_count("ofa-fail"), 3);
+        assert_eq!(read_actor_call_count("ofa-fail").await, 3);
         // "ofa-normal" also restarts each time, so also spawned 3 times
-        assert_eq!(read_actor_call_count("ofa-normal"), 3);
+        assert_eq!(read_actor_call_count("ofa-normal").await, 3);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_rest_for_one_restart_subset() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // meltdown on 2nd fail => max_restarts=1 => meltdown at fail #2
         let child_a = make_child_spec(
@@ -1178,12 +1259,8 @@ mod tests {
             child_specs: vec![child_a, child_b, child_c],
             options,
         };
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_rest_for_one_restart_subset".into()),
-            Supervisor,
-            args,
-        )
-        .await?;
+        let (sup_ref, sup_handle) =
+            Supervisor::spawn("test_rest_for_one_restart_subset".into(), Supervisor, args).await?;
 
         sleep(Duration::from_millis(100)).await;
         let running_children = get_running_children(&sup_ref);
@@ -1192,7 +1269,7 @@ mod tests {
         let _ = sup_handle.await;
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
 
-        let final_state = read_final_supervisor_state("test_rest_for_one_restart_subset");
+        let final_state = read_final_supervisor_state("test_rest_for_one_restart_subset").await;
         assert_eq!(sup_ref.get_children().len(), 0);
         assert_eq!(final_state.restart_log.len(), 2);
         assert_eq!(final_state.restart_log[0].child_id, "B");
@@ -1200,16 +1277,16 @@ mod tests {
 
         // "B" fails => triggers a restart for B (and everything after B: child C)
         // meltdown on 2nd fail => total spawns for B = 2, C = 2, A stays up from the start => 1
-        assert_eq!(read_actor_call_count("A"), 1);
-        assert_eq!(read_actor_call_count("B"), 2);
-        assert_eq!(read_actor_call_count("C"), 2);
+        assert_eq!(read_actor_call_count("A").await, 1);
+        assert_eq!(read_actor_call_count("B").await, 2);
+        assert_eq!(read_actor_call_count("C").await, 2);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_max_restarts_in_time_window() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // meltdown on 3 fails in <1s => max_restarts=2 => meltdown on fail #3
         let child_spec =
@@ -1226,17 +1303,13 @@ mod tests {
             options,
         };
 
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_max_restarts_in_time_window".into()),
-            Supervisor,
-            args,
-        )
-        .await?;
+        let (sup_ref, sup_handle) =
+            Supervisor::spawn("test_max_restarts_in_time_window".into(), Supervisor, args).await?;
 
         let _ = sup_handle.await;
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
 
-        let final_state = read_final_supervisor_state("test_max_restarts_in_time_window");
+        let final_state = read_final_supervisor_state("test_max_restarts_in_time_window").await;
         assert_eq!(
             final_state.restart_log.len(),
             3,
@@ -1244,14 +1317,14 @@ mod tests {
         );
 
         // 3 fails => total spawns is 3
-        assert_eq!(read_actor_call_count("fastfail"), 3);
+        assert_eq!(read_actor_call_count("fastfail").await, 3);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_transient_abnormal_exit() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // meltdown on 1st fail => max_restarts=0
         let child_spec = make_child_spec(
@@ -1271,17 +1344,13 @@ mod tests {
             child_specs: vec![child_spec],
             options,
         };
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_transient_abnormal_exit".into()),
-            Supervisor,
-            args,
-        )
-        .await?;
+        let (sup_ref, sup_handle) =
+            Supervisor::spawn("test_transient_abnormal_exit".into(), Supervisor, args).await?;
 
         let _ = sup_handle.await;
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
 
-        let final_state = read_final_supervisor_state("test_transient_abnormal_exit");
+        let final_state = read_final_supervisor_state("test_transient_abnormal_exit").await;
         assert_eq!(
             final_state.restart_log.len(),
             1,
@@ -1289,14 +1358,14 @@ mod tests {
         );
 
         // Only ever spawned once; meltdown immediately
-        assert_eq!(read_actor_call_count("transient-bad"), 1);
+        assert_eq!(read_actor_call_count("transient-bad").await, 1);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_backoff_fn_delays_restart() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // meltdown on 2nd fail => set max_restarts=1 => meltdown on fail #2
         // but we do a 2s child-level backoff for the second spawn
@@ -1324,12 +1393,8 @@ mod tests {
         };
 
         let before = Instant::now();
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_backoff_fn_delays_restart".into()),
-            Supervisor,
-            args,
-        )
-        .await?;
+        let (sup_ref, sup_handle) =
+            Supervisor::spawn("test_backoff_fn_delays_restart".into(), Supervisor, args).await?;
         let _ = sup_handle.await;
 
         let elapsed = before.elapsed();
@@ -1339,7 +1404,7 @@ mod tests {
         );
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
 
-        let final_st = read_final_supervisor_state("test_backoff_fn_delays_restart");
+        let final_st = read_final_supervisor_state("test_backoff_fn_delays_restart").await;
         assert_eq!(
             final_st.restart_log.len(),
             2,
@@ -1347,14 +1412,14 @@ mod tests {
         );
 
         // Exactly 2 spawns
-        assert_eq!(read_actor_call_count("backoff"), 2);
+        assert_eq!(read_actor_call_count("backoff").await, 2);
 
         Ok(())
     }
 
     #[ractor::concurrency::test]
     async fn test_restart_counter_reset_after() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         // Child fails 2 times quickly => meltdown log=2
         // Wait 3s => meltdown log is cleared => final fail => meltdown log=1 => no meltdown
@@ -1389,8 +1454,8 @@ mod tests {
             child_specs: vec![child_spec],
             options,
         };
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_restart_counter_reset_after_improved".into()),
+        let (sup_ref, sup_handle) = Supervisor::spawn(
+            "test_restart_counter_reset_after_improved".into(),
             Supervisor,
             args,
         )
@@ -1403,7 +1468,8 @@ mod tests {
         sup_ref.stop(None);
         let _ = sup_handle.await;
 
-        let final_st = read_final_supervisor_state("test_restart_counter_reset_after_improved");
+        let final_st =
+            read_final_supervisor_state("test_restart_counter_reset_after_improved").await;
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
         assert_eq!(
             final_st.restart_log.len(),
@@ -1414,7 +1480,7 @@ mod tests {
         // The child was actually spawned 4 times:
         //  - Start #1 => fail #1 => restart => #2 => fail #2 => restart => #3
         //  - Then quiet 3s => meltdown log cleared => fail #3 => meltdown log=1 => restart => #4
-        assert_eq!(read_actor_call_count("reset-test"), 4);
+        assert_eq!(read_actor_call_count("reset-test").await, 4);
 
         Ok(())
     }
@@ -1422,7 +1488,7 @@ mod tests {
     #[ractor::concurrency::test]
     async fn test_child_level_restart_counter_reset_after() -> Result<(), Box<dyn std::error::Error>>
     {
-        before_each();
+        before_each().await;
 
         // The child fails 2 times => restarts => after 3s quiet, we reset
         // => final fail is treated like "fail #1" from the child's perspective
@@ -1451,8 +1517,8 @@ mod tests {
             options,
         };
 
-        let (sup_ref, sup_handle) = Actor::spawn(
-            Some("test_child_level_restart_counter_reset_after".into()),
+        let (sup_ref, sup_handle) = Supervisor::spawn(
+            "test_child_level_restart_counter_reset_after".into(),
             Supervisor,
             args,
         )
@@ -1471,7 +1537,8 @@ mod tests {
         sup_ref.stop(None);
         let _ = sup_handle.await;
 
-        let final_st = read_final_supervisor_state("test_child_level_restart_counter_reset_after");
+        let final_st =
+            read_final_supervisor_state("test_child_level_restart_counter_reset_after").await;
         let cfs2 = final_st.child_failure_state.get("child-reset").unwrap();
         assert_eq!(
             cfs2.restart_count, 1,
@@ -1479,7 +1546,7 @@ mod tests {
         );
 
         // total spawns = 4
-        assert_eq!(read_actor_call_count("child-reset"), 4);
+        assert_eq!(read_actor_call_count("child-reset").await, 4);
 
         Ok(())
     }
@@ -1489,7 +1556,7 @@ mod tests {
     //
     #[ractor::concurrency::test]
     async fn test_nested_supervisors() -> Result<(), Box<dyn std::error::Error>> {
-        before_each();
+        before_each().await;
 
         async fn spawn_subsupervisor(
             sup_cell: ActorCell,
@@ -1497,7 +1564,7 @@ mod tests {
             args: SupervisorArguments,
         ) -> Result<ActorCell, SpawnErr> {
             let (sub_sup_ref, _join) =
-                Actor::spawn_linked(Some(id.into()), Supervisor, args, sup_cell).await?;
+                Supervisor::spawn_linked(id, Supervisor, args, sup_cell).await?;
             Ok(sub_sup_ref.get_cell())
         }
 
@@ -1545,7 +1612,7 @@ mod tests {
         };
 
         let (root_sup_ref, root_handle) =
-            Actor::spawn(Some("root-sup".into()), Supervisor, root_args).await?;
+            Supervisor::spawn("root-sup".into(), Supervisor, root_args).await?;
 
         // Wait for "leaf-worker" to fail once
         sleep(Duration::from_millis(600)).await;
@@ -1555,13 +1622,13 @@ mod tests {
         root_sup_ref.stop(None);
         let _ = root_handle.await;
 
-        let root_final = read_final_supervisor_state("root-sup");
-        let sub_final = read_final_supervisor_state("sub-sup");
+        let root_final = read_final_supervisor_state("root-sup").await;
+        let sub_final = read_final_supervisor_state("sub-sup").await;
 
         assert_eq!(root_final.restart_log.len(), 0);
         assert_eq!(sub_final.restart_log.len(), 1);
 
-        assert_eq!(read_actor_call_count("leaf-worker"), 2);
+        assert_eq!(read_actor_call_count("leaf-worker").await, 2);
 
         Ok(())
     }

@@ -15,7 +15,7 @@ A **pure-Rust** supervisor built atop the [`ractor`](https://github.com/slawlor/
 Add the following to your `Cargo.toml`:
 ```toml
 [dependencies]
-ractor-supervisor = "0.1"
+ractor-supervisor = "0.1.3"
 ractor = "0.14"
 ```
 
@@ -31,6 +31,13 @@ These options control the **supervisor-wide** meltdown logic and overall restart
   - **OneForAll**: If any child fails, *all* children are stopped and restarted.
   - **RestForOne**: The failing child and all subsequent children (in definition order) are stopped and restarted.
   
+  Strategies apply to **all failure scenarios**, including:
+    - Spawn errors (failures in `pre_start`/`post_start`)
+    - Runtime panics
+    - Normal and abnormal exits
+
+    Example: If spawning a child fails during pre_start, it will count as a restart and trigger strategy logic
+
 - **`max_restarts`** + **`max_seconds`**  
   Meltdown window. If `max_restarts` is exceeded within `max_seconds`, the supervisor triggers a meltdown and stops abnormally.
 
@@ -62,6 +69,18 @@ For example, you might have:
 
 With nested supervision, you can isolate failures and keep the rest of your system running.
 
+When creating supervisors ensure you use [`Supervisor::spawn_linked`] or [`Supervisor::spawn`] rather than the generic
+[`Actor::spawn`] methods to maintain proper supervision links:
+
+```rust
+// When spawning a child supervisor:
+Supervisor::spawn_linked(
+    "sub-supervisor".into(), 
+    Supervisor,
+    args,
+    parent_supervisor_cell
+).await?;
+```
 
 ## Usage
 
@@ -114,7 +133,7 @@ async fn spawn_my_worker(
         Some(child_id), // actor name
         MyWorker,                    // actor instance
         (),                          // arguments
-        supervisor_cell             // link to the supervisor
+        supervisor_cell              // link to the supervisor
     ).await?;
     Ok(child_ref.get_cell())
 }
@@ -161,8 +180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Spawn the supervisor with our arguments.
-    let (sup_ref, sup_handle) = Actor::spawn(
-        None,        // no name for the supervisor
+    let (sup_ref, sup_handle) = Supervisor::spawn(
+        "root".into(), // name for the supervisor
         Supervisor,  // the Supervisor actor
         args
     ).await?;
