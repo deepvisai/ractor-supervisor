@@ -90,7 +90,7 @@ Below is a **full** code snippet showing how to configure and spawn the supervis
 use ractor::Actor;
 use ractor_supervisor::*;
 use std::{time::Duration, sync::Arc};
-use tokio::time::Instant;
+use ractor::concurrency::Instant;
 use futures_util::FutureExt;
 
 // A minimal child actor that simply does some work in `handle`.
