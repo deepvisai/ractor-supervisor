@@ -169,7 +169,9 @@
 pub mod core;
 pub mod dynamic;
 pub mod supervisor;
+pub mod task;
 
 pub use core::*;
 pub use dynamic::*;
 pub use supervisor::*;
+pub use task::*;
