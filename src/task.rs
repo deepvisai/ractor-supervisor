@@ -17,7 +17,18 @@ pub enum TaskActorMessage {
     Run { task: TaskFn },
 }
 
-pub type TaskFn = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+#[derive(Clone)]
+pub struct TaskFn(Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>);
+
+impl TaskFn {
+    pub fn new<F, Fut>(factory: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        TaskFn(Arc::new(move || Box::pin(factory())))
+    }
+}
 
 #[ractor::async_trait]
 impl Actor for TaskActor {
@@ -35,11 +46,11 @@ impl Actor for TaskActor {
 
     async fn post_start(
         &self,
-        _myself: ActorRef<Self::Msg>,
+        myself: ActorRef<Self::Msg>,
         task: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        (task)().await;
-
+        (task.0)().await;
+        myself.stop(None);
         Ok(())
     }
 }
@@ -101,23 +112,31 @@ impl TaskSupervisor {
         DynamicSupervisor::spawn(name, options).await
     }
 
-    pub async fn spawn_task<F>(
-        task: fn() -> Pin<Box<dyn Future<Output = ()> + Send>>,
+    pub async fn spawn_task<F, Fut>(
         supervisor: ActorRef<TaskSupervisorMsg>,
+        task: F,
         options: TaskOptions,
-    ) -> Result<(), ActorProcessingErr> {
+    ) -> Result<String, ActorProcessingErr>
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let child_id = options.name;
-        let task_ref = Arc::new(task);
+        let task_wrapper = TaskFn::new(task);
+
         let spec = ChildSpec {
             id: child_id.clone(),
-            spawn_fn: Arc::new(move |sup, id| spawn_task_actor(id, task_ref.clone(), sup).boxed()),
+            spawn_fn: Arc::new({
+                let task_wrapper = task_wrapper.clone();
+                move |sup, id| spawn_task_actor(id, task_wrapper.clone(), sup).boxed()
+            }),
             restart: options.restart,
             backoff_fn: options.backoff_fn,
             restart_counter_reset_after: options.restart_counter_reset_after,
         };
 
         DynamicSupervisor::spawn_child(supervisor, spec).await?;
-        Ok(())
+        Ok(child_id)
     }
 
     pub async fn terminate_task(
@@ -132,4 +151,160 @@ async fn spawn_task_actor(id: String, task: TaskFn, sup: ActorCell) -> Result<Ac
     let (child_ref, _join) = DynamicSupervisor::spawn_linked(id, TaskActor, task, sup).await?;
 
     Ok(child_ref.get_cell())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ractor::{
+        call,
+        concurrency::{sleep, Duration},
+        ActorStatus,
+    };
+    use serial_test::serial;
+    use tokio::sync::mpsc;
+
+    async fn before_each() {
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    #[ractor::concurrency::test]
+    #[serial]
+    async fn test_basic_task_execution() {
+        before_each().await;
+
+        let (supervisor, handle) = TaskSupervisor::spawn(
+            "test-supervisor".into(),
+            TaskSupervisorOptions {
+                max_children: Some(10),
+                max_restarts: 3,
+                max_seconds: 1,
+                restart_counter_reset_after: Some(1000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+
+        let task_id = TaskSupervisor::spawn_task(
+            supervisor.clone(),
+            move || {
+                // Clone again for each restart
+                let tx = tx.clone();
+                async move {
+                    tx.send(()).await.unwrap();
+                }
+            },
+            TaskOptions::new().name("background-task".into()),
+        )
+        .await
+        .unwrap();
+
+        rx.recv().await.expect("Task should have executed");
+        sleep(Duration::from_millis(100)).await;
+        let state = call!(supervisor, DynamicSupervisorMsg::InspectState).unwrap();
+
+        assert!(!state.active_children.contains_key(&task_id));
+
+        supervisor.stop(None);
+        let _ = handle.await;
+    }
+
+    #[ractor::concurrency::test]
+    #[serial]
+    async fn test_task_termination() {
+        before_each().await;
+
+        let (supervisor, handle) = TaskSupervisor::spawn(
+            "test-supervisor".into(),
+            DynamicSupervisorOptions {
+                max_children: Some(10),
+                max_restarts: 3,
+                max_seconds: 1,
+                restart_counter_reset_after: Some(1000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let task_id = TaskSupervisor::spawn_task(
+            supervisor.clone(),
+            move || {
+                // Clone again for each restart
+                let tx = tx.clone();
+                async move {
+                    sleep(Duration::from_secs(10)).await;
+                    tx.send(()).await.unwrap();
+                }
+            },
+            TaskOptions::new().restart_policy(Restart::Permanent),
+        )
+        .await
+        .unwrap();
+
+        // Terminate before completion
+        TaskSupervisor::terminate_task(supervisor.clone(), task_id.clone())
+            .await
+            .unwrap();
+
+        // Verify task didn't complete
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(result.is_err(), "Task should have been terminated");
+
+        supervisor.stop(None);
+        let _ = handle.await;
+    }
+
+    #[ractor::concurrency::test]
+    #[serial]
+    async fn test_restart_policy() {
+        before_each().await;
+
+        let (supervisor, handle) = TaskSupervisor::spawn(
+            "test-supervisor".into(),
+            DynamicSupervisorOptions {
+                max_children: Some(10),
+                max_restarts: 3,
+                max_seconds: 1,
+                restart_counter_reset_after: Some(1000),
+            },
+        )
+        .await
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::channel(3);
+        let _task_id = TaskSupervisor::spawn_task(
+            supervisor.clone(),
+            move || {
+                // Clone again for each restart
+                let tx = tx.clone();
+                async move {
+                    tx.send(()).await.unwrap();
+                    panic!("Simulated failure");
+                }
+            },
+            TaskOptions::new()
+                .restart_policy(Restart::Transient)
+                .name("restart-test".into()),
+        )
+        .await
+        .unwrap();
+
+        // Verify multiple restarts
+        for _ in 0..4 {
+            rx.recv().await.expect("Task should have restarted");
+        }
+
+        // Should be terminated after 3 failures (+1 initial)
+        sleep(Duration::from_millis(100)).await;
+        assert!(!supervisor
+            .get_children()
+            .iter()
+            .any(|cell| cell.get_status() == ActorStatus::Running));
+
+        supervisor.stop(None);
+        let _ = handle.await;
+    }
 }
