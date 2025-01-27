@@ -2,23 +2,50 @@
 //!
 //! An **OTP-style supervisor** for the [`ractor`](https://docs.rs/ractor) framework—helping you build **supervision trees** in a straightforward, Rust-centric way.
 //!
-//! Inspired by the Elixir/Erlang supervision concept, `ractor-supervisor` provides a robust mechanism for overseeing **one or more child actors** and automatically restarting them under configurable policies. If too many restarts happen in a brief time window—a “meltdown”—the supervisor itself shuts down abnormally, preventing errant restart loops.
+//! Inspired by the Elixir/Erlang supervision concept, `ractor-supervisor` provides a robust mechanism for overseeing **one or more child actors** and automatically restarting them under configurable policies. If too many restarts happen in a brief time window—a "meltdown"—the supervisor itself shuts down abnormally, preventing errant restart loops.
 //!
-//! **Goal**: Make it easier to define, configure, and maintain supervision trees in your `ractor`-based applications. With multiple restart policies, flexible supervision strategies, custom backoff support, and meltdown counters, `ractor-supervisor` helps you keep your actor systems both **resilient** and **performant**.
+//! ## Supervisor Types
 //!
-//! ## Overview
+//! This crate provides three types of supervisors, each designed for specific use cases:
 //!
-//! ### Supervision Strategies
+//! ### 1. Static Supervisor (`Supervisor`)
+//! - Manages a fixed set of children defined at startup
+//! - Supports all supervision strategies (OneForOne, OneForAll, RestForOne)
+//! - Best for static actor hierarchies where child actors are known at startup
+//! - Example: A web server with predefined worker pools, cache managers, and connection handlers
+//!
+//! ### 2. Dynamic Supervisor (`DynamicSupervisor`)
+//! - Allows adding/removing children at runtime
+//! - Uses OneForOne strategy only (each child managed independently)
+//! - Optional `max_children` limit
+//! - Best for dynamic workloads where children are spawned/terminated on demand
+//! - Example: A job queue processor that spawns worker actors based on load
+//!
+//! ### 3. Task Supervisor (`TaskSupervisor`)
+//! - Specialized version of DynamicSupervisor for managing async tasks
+//! - Wraps futures in actor tasks that can be supervised
+//! - Simpler API focused on task execution rather than actor management
+//! - Best for background jobs, periodic tasks, or any async work needing supervision
+//! - Example: Scheduled jobs, background data processing, or cleanup tasks
+//!
+//! ## Supervision Strategies
+//!
+//! The strategy defines what happens when a child fails:
+//!
 //! - **OneForOne**: Only the failing child is restarted.
 //! - **OneForAll**: If any child fails, all children are stopped and restarted.
-//! - **RestForOne**: The failing child and all subsequent children (as defined in order) are stopped and restarted.
+//! - **RestForOne**: The failing child and all subsequent children (in definition order) are stopped and restarted.
 //!
 //! Strategies apply to **all failure scenarios**, including:
 //! - Spawn errors (failures in `pre_start`/`post_start`)
 //! - Runtime panics
 //! - Normal and abnormal exits
 //!
-//! Example: If spawning a child fails during pre_start, it will count as a restart and trigger strategy logic
+//! Example: If spawning a child fails during pre_start, it will count as a restart and trigger strategy logic.
+//!
+//! ## Common Features
+//!
+//! All supervisor types share these core features:
 //!
 //! ### Restart Policies
 //! - **Permanent**: Always restart, no matter how the child exited.
@@ -26,41 +53,62 @@
 //! - **Temporary**: Never restart, regardless of exit reason.
 //!
 //! ### Meltdown Logic
-//! - **`max_restarts`** and **`max_seconds`**: The “time window” for meltdown counting. If more than `max_restarts` occur within `max_seconds`, the supervisor shuts down abnormally (meltdown).
-//! - **`restart_counter_reset_after`**: If the supervisor sees no failures for this many seconds, it clears its meltdown log and effectively “resets” the meltdown counters.
+//! - **`max_restarts`** and **`max_seconds`**: The "time window" for meltdown counting. If more than `max_restarts` occur within `max_seconds`, the supervisor shuts down abnormally (meltdown).
+//! - **`restart_counter_reset_after`**: If the supervisor sees no failures for this many seconds, it clears its meltdown log and effectively "resets" the meltdown counters.
 //!
-//! ### Child-Level Resets & Backoff
+//! ### Child-Level Features
 //! - **`restart_counter_reset_after`** (per child): If a specific child remains up for that many seconds, its own failure count is reset to zero on the next failure.
-//! - **`backoff_fn`**: An optional function to delay a child’s restart. For instance, you might implement exponential backoff to prevent immediate thrashing restarts.
+//! - **`backoff_fn`**: An optional function to delay a child's restart. For instance, you might implement exponential backoff to prevent immediate thrashing restarts.
+//!
+//! ## Choosing the Right Supervisor
+//!
+//! 1. Use `Supervisor` when:
+//!    - Your actor hierarchy is known at startup
+//!    - You need OneForAll or RestForOne strategies
+//!    - Children are long-lived and relatively static
+//!
+//! 2. Use `DynamicSupervisor` when:
+//!    - Children need to be added/removed at runtime
+//!    - Each child is independent (OneForOne is sufficient)
+//!    - You need to limit the total number of children
+//!
+//! 3. Use `TaskSupervisor` when:
+//!    - You're working with futures/async tasks rather than full actors
+//!    - Tasks are short-lived or periodic
+//!    - You want a simpler API focused on task execution
+//!
+//! ## Important Requirements
+//!
+//! 1. **Actor Names**: Both supervisors and their child actors **must** have names set. These names are used for:
+//!    - Unique identification in the supervision tree
+//!    - Meltdown tracking and logging
+//!    - Global actor registry
+//!
+//! 2. **Proper Spawning**: When spawning supervisors or child actors, always use:
+//!    - [`Supervisor::spawn_linked`] or [`Supervisor::spawn`] for static supervisors
+//!    - [`DynamicSupervisor::spawn_linked`] or [`DynamicSupervisor::spawn`] for dynamic supervisors
+//!    - Do NOT use the generic [`Actor::spawn_linked`] directly
 //!
 //! ## Multi-Level Supervision Trees
 //!
-//! Supervisors can manage other **supervisors** as children, forming a **hierarchical** or **tree** structure. This way, different subsystems can each have their own meltdown thresholds or strategies. A meltdown in one subtree doesn’t necessarily mean the entire application must go down, unless the top-level supervisor is triggered.
+//! Supervisors can manage other **supervisors** as children, forming a **hierarchical** or **tree** structure. This way, different subsystems can each have their own meltdown thresholds or strategies. A meltdown in one subtree doesn't necessarily mean the entire application must go down, unless the top-level supervisor is triggered.
 //!
-//! For example, you might have:
-//! - **Root Supervisor** (OneForOne)
-//!   - **Sub-supervisor A** (OneForAll)
-//!     - Child actor #1
-//!     - Child actor #2
-//!   - **Sub-supervisor B** (RestForOne)
-//!     - Child actor #3
-//!     - Child actor #4
+//! For example:
+//! ```text
+//! Root Supervisor (Static, OneForOne)
+//! ├── API Supervisor (Static, OneForAll)
+//! │   ├── HTTP Server
+//! │   └── WebSocket Server
+//! ├── Worker Supervisor (Dynamic)
+//! │   └── [Dynamic Worker Pool]
+//! └── Task Supervisor
+//!     └── [Background Jobs]
+//! ```
 //!
-//! With nested supervision, you can isolate failures and keep the rest of your system running.
+//! ## Example Usage
 //!
-//! When creating supervisors ensure you use [`Supervisor::spawn_linked`] or [`Supervisor::spawn`] rather than the generic
-//! [`Actor::spawn`] methods to maintain proper supervision links.
+//! Here's a complete example using a static supervisor:
 //!
-//! ## Usage
-//! 1. **Define** one or more child actors by implementing [`Actor`].
-//! 2. For each child, create a [`ChildSpec`] with:
-//!    - A [`Restart`] policy,
-//!    - A `spawn_fn` that links the child to its supervisor,
-//!    - Optional `backoff_fn` / meltdown resets.
-//! 3. Configure [`SupervisorOptions`], specifying meltdown thresholds (`max_restarts`, `max_seconds`) and a supervision [`Strategy`].
-//! 4. Pass those into [`SupervisorArguments`] and **spawn** your [`Supervisor`] via `Supervisor::spawn(...)`.
-//!
-//! ## Example
 //! ```rust
 //! use ractor::Actor;
 //! use ractor_supervisor::*;
@@ -77,7 +125,7 @@
 //!     type State = ();
 //!     type Arguments = ();
 //!
-//!     // Called before the actor fully starts. We can set up the actor’s internal state here.
+//!     // Called before the actor fully starts. We can set up the actor's internal state here.
 //!     async fn pre_start(
 //!         &self,
 //!         _myself: ractor::ActorRef<Self::Msg>,
@@ -86,7 +134,7 @@
 //!         Ok(())
 //!     }
 //!
-//!     // The main message handler. This is where you implement your actor’s behavior.
+//!     // The main message handler. This is where you implement your actor's behavior.
 //!     async fn handle(
 //!         &self,
 //!         _myself: ractor::ActorRef<Self::Msg>,
@@ -104,8 +152,8 @@
 //!     child_id: String
 //! ) -> Result<ractor::ActorCell, ractor::SpawnErr> {
 //!     // We name the child actor using `child_spec.id` (though naming is optional).
-//!     let (child_ref, _join) = MyWorker::spawn_linked(
-//!         Some(child_id), // actor name
+//!     let (child_ref, _join) = Supervisor::spawn_linked(
+//!         child_id,                    // actor name
 //!         MyWorker,                    // actor instance
 //!         (),                          // arguments
 //!         supervisor_cell             // link to the supervisor
@@ -166,6 +214,12 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! For more examples, see:
+//! - [`Supervisor`] for static supervision
+//! - [`DynamicSupervisor`] for dynamic child management
+//! - [`TaskSupervisor`] for supervised async tasks
+//!
 pub mod core;
 pub mod dynamic;
 pub mod supervisor;

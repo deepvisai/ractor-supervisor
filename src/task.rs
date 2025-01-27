@@ -1,3 +1,93 @@
+//! Task supervisor for managing supervised async tasks.
+//!
+//! The `TaskSupervisor` is a specialized version of [`DynamicSupervisor`](crate::DynamicSupervisor) that makes it easy
+//! to run async tasks (futures) under supervision. It wraps each task in a lightweight actor that can be monitored
+//! and restarted according to the configured policy.
+//!
+//! ## Use Cases
+//!
+//! The `TaskSupervisor` is ideal for:
+//! - Background jobs that need supervision
+//! - Periodic tasks that should be restarted on failure
+//! - Long-running async operations that need monitoring
+//! - Any async work that should be part of your supervision tree
+//!
+//! ## Key Features
+//!
+//! 1. **Simple API**: Wrap any async task in supervision with minimal boilerplate
+//! 2. **Full Supervision**: Tasks get all the benefits of actor supervision
+//! 3. **Flexible Policies**: Control restart behavior via [`TaskOptions`]
+//! 4. **Resource Control**: Inherit `max_children` and other limits from `DynamicSupervisor`
+//!
+//! ## Example
+//!
+//! ```rust
+//! use ractor_supervisor::*;
+//! use std::time::Duration;
+//! use tokio::time::sleep;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     // Configure the task supervisor
+//!     let options = TaskSupervisorOptions {
+//!         max_children: Some(10),
+//!         max_restarts: 3,
+//!         max_seconds: 10,
+//!         restart_counter_reset_after: Some(30),
+//!     };
+//!
+//!     // Spawn the supervisor
+//!     let (sup_ref, _) = TaskSupervisor::spawn(
+//!         "task-sup".into(),
+//!         options
+//!     ).await.unwrap();
+//!
+//!     // Define a task that might fail
+//!     let task_id = TaskSupervisor::spawn_task(
+//!         sup_ref.clone(),
+//!         || async {
+//!             // Simulate some work
+//!             sleep(Duration::from_secs(1)).await;
+//!             
+//!             // Maybe fail sometimes...
+//!             if rand::random() {
+//!                 panic!("Random failure!");
+//!             }
+//!         },
+//!         TaskOptions::new()
+//!             .name("periodic-job".into())
+//!             .restart_policy(Restart::Permanent)
+//!     ).await.unwrap();
+//!
+//!     // Later, stop the task if needed
+//!     TaskSupervisor::terminate_task(sup_ref, task_id).await.unwrap();
+//!
+//!     ()
+//! }
+//! ```
+//!
+//! ## Task Lifecycle
+//!
+//! 1. When you call [`TaskSupervisor::spawn_task`]:
+//!    - Your async task is wrapped in a [`TaskActor`]
+//!    - The actor is spawned under the supervisor
+//!    - The task starts executing immediately
+//!
+//! 2. If the task completes normally:
+//!    - The actor stops normally
+//!    - If policy is [`Restart::Permanent`], it's restarted
+//!    - If policy is [`Restart::Transient`] or [`Restart::Temporary`], it's not restarted
+//!
+//! 3. If the task panics:
+//!    - The actor fails abnormally
+//!    - If policy is [`Restart::Permanent`] or [`Restart::Transient`], it's restarted
+//!    - If policy is [`Restart::Temporary`], it's not restarted
+//!
+//! 4. Restart behavior is controlled by:
+//!    - The [`TaskOptions::restart_policy`]
+//!    - The supervisor's meltdown settings
+//!    - Any configured backoff delays
+
 use futures_util::FutureExt;
 use ractor::concurrency::JoinHandle;
 use ractor::{Actor, ActorCell, ActorName, ActorProcessingErr, ActorRef, SpawnErr};
@@ -11,16 +101,21 @@ use crate::{
     ChildBackoffFn, DynamicSupervisor, DynamicSupervisorMsg, DynamicSupervisorOptions, Restart,
 };
 
+/// Actor that wraps and executes an async task.
 pub struct TaskActor;
 
+/// Messages that can be sent to a [`TaskActor`].
 pub enum TaskActorMessage {
+    /// Execute the wrapped task.
     Run { task: TaskFn },
 }
 
+/// A wrapped async task that can be executed by a [`TaskActor`].
 #[derive(Clone)]
 pub struct TaskFn(Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>);
 
 impl TaskFn {
+    /// Create a new task wrapper from an async function.
     pub fn new<F, Fut>(factory: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
