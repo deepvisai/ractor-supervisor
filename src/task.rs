@@ -53,6 +53,8 @@
 //!             if rand::random() {
 //!                 panic!("Random failure!");
 //!             }
+//! 
+//!             Ok(())
 //!         },
 //!         TaskOptions::new()
 //!             .name("periodic-job".into())
@@ -110,16 +112,19 @@ pub enum TaskActorMessage {
     Run { task: TaskFn },
 }
 
+/// The result of a task execution.
+type TaskFuture = Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send>>;
+
 /// A wrapped async task that can be executed by a [`TaskActor`].
 #[derive(Clone)]
-pub struct TaskFn(Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>);
+pub struct TaskFn(Arc<dyn Fn() -> TaskFuture + Send + Sync>);
 
 impl TaskFn {
     /// Create a new task wrapper from an async function.
     pub fn new<F, Fut>(factory: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = Result<(), ActorProcessingErr>> + Send + 'static,
     {
         TaskFn(Arc::new(move || Box::pin(factory())))
     }
@@ -144,7 +149,7 @@ impl Actor for TaskActor {
         myself: ActorRef<Self::Msg>,
         task: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
-        (task.0)().await;
+        (task.0)().await?;
         myself.stop(None);
         Ok(())
     }
@@ -207,6 +212,14 @@ impl TaskSupervisor {
         DynamicSupervisor::spawn(name, options).await
     }
 
+    pub async fn spawn_linked(
+        name: ActorName,
+        startup_args: TaskSupervisorOptions,
+        supervisor: ActorCell,
+    ) -> Result<(ActorRef<TaskSupervisorMsg>, JoinHandle<()>), SpawnErr> {
+        Actor::spawn_linked(Some(name), DynamicSupervisor, startup_args, supervisor).await
+    }
+
     pub async fn spawn_task<F, Fut>(
         supervisor: ActorRef<TaskSupervisorMsg>,
         task: F,
@@ -214,7 +227,7 @@ impl TaskSupervisor {
     ) -> Result<String, ActorProcessingErr>
     where
         F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = Result<(), ActorProcessingErr>> + Send + 'static,
     {
         let child_id = options.name;
         let task_wrapper = TaskFn::new(task);
@@ -289,6 +302,8 @@ mod tests {
                 let tx = tx.clone();
                 async move {
                     tx.send(()).await.unwrap();
+
+                    Ok(())
                 }
             },
             TaskOptions::new().name("background-task".into()),
@@ -332,6 +347,7 @@ mod tests {
                 async move {
                     sleep(Duration::from_secs(10)).await;
                     tx.send(()).await.unwrap();
+                    Ok(())
                 }
             },
             TaskOptions::new().restart_policy(Restart::Permanent),
