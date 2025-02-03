@@ -26,19 +26,75 @@ pub enum SupervisorError {
 ///
 /// This function is invoked each time a child fails:
 /// ```ignore
-/// (child_id, current_restart_count, last_fail_instant, child_reset_after)
+/// (child_id, current_restart_count, last_fail_instant, reset_after)
 ///    -> Option<Duration>
 /// ```
 /// If you return `Some(duration)`, the supervisor will wait that amount of time before actually re-spawning the child.
 /// If `None`, it restarts immediately.
-pub type ChildBackoffFn =
-    Arc<dyn Fn(&str, usize, Instant, Option<u64>) -> Option<Duration> + Send + Sync>;
+#[derive(Clone)]
+pub struct ChildBackoffFn(
+    pub Arc<dyn Fn(&str, usize, Instant, Option<Duration>) -> Option<Duration> + Send + Sync>,
+);
+
+impl ChildBackoffFn {
+    /// Create a new ChildBackoffFn from a closure.
+    ///
+    /// # Example
+    /// ```rust, ignore
+    /// let backoff_fn = ChildBackoffFn::new(|child_id, restart_count, last_restart, reset_after| {
+    ///     // Your backoff logic here...
+    ///     Some(Duration::from_millis(100))
+    /// });
+    /// ```
+    pub fn new<F>(func: F) -> Self
+    where
+        F: Fn(&str, usize, Instant, Option<Duration>) -> Option<Duration> + Send + Sync + 'static,
+    {
+        Self(Arc::new(func))
+    }
+
+    /// Calls the inner backoff function.
+    pub fn call(
+        &self,
+        child_id: &str,
+        restart_count: usize,
+        last_restart: Instant,
+        reset_after: Option<Duration>,
+    ) -> Option<Duration> {
+        (self.0)(child_id, restart_count, last_restart, reset_after)
+    }
+}
 
 /// The future returned by a [`SpawnFn`].
 pub type SpawnFuture = Pin<Box<dyn Future<Output = Result<ActorCell, SpawnErr>> + Send>>;
 
 /// User-provided closure to spawn a child. You typically call `Supervisor::spawn_linked` here.
-pub type SpawnFn = Arc<dyn Fn(ActorCell, String) -> SpawnFuture + Send + Sync>;
+#[derive(Clone)]
+pub struct SpawnFn(pub Arc<dyn Fn(ActorCell, String) -> SpawnFuture + Send + Sync>);
+
+impl SpawnFn {
+    /// Create a new SpawnFn from a closure.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let spawn_fn = SpawnFn::new(move |cell, id| {
+    ///     // Your actor-spawning logic here...
+    ///     spawn_my_actor(cell, id).await
+    /// });
+    /// ```
+    pub fn new<F, Fut>(func: F) -> Self
+    where
+        F: Fn(ActorCell, String) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ActorCell, SpawnErr>> + Send + 'static,
+    {
+        Self(Arc::new(move |cell, id| Box::pin(func(cell, id))))
+    }
+
+    /// Calls the inner spawn function.
+    pub fn call(&self, cell: ActorCell, id: String) -> SpawnFuture {
+        (self.0)(cell, id)
+    }
+}
 
 /// Defines how a child actor is restarted after it exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,14 +130,9 @@ pub struct ChildSpec {
     /// A child-level backoff function. If set, this can delay re-spawning the child after a crash.
     pub backoff_fn: Option<ChildBackoffFn>,
 
-    /// Optional child-level meltdown “reset.” If the child hasn’t failed in `restart_counter_reset_after` seconds,
-    /// we reset *this child’s* failure count to 0 next time it fails.  
-    ///
-    /// This is **separate** from the supervisor-level meltdown logic in [`SupervisorOptions`].
-    ///
-    /// # Units
-    /// Specified in **seconds** as a `u64` value.
-    pub restart_counter_reset_after: Option<u64>,
+    /// Optional child-level meltdown “reset.” If the child hasn’t failed in the `reset_after` duration,
+    /// we reset *this child’s* failure count to 0 next time it fails.
+    pub reset_after: Option<Duration>,
 }
 
 impl std::fmt::Debug for ChildSpec {
@@ -89,10 +140,7 @@ impl std::fmt::Debug for ChildSpec {
         f.debug_struct("ChildSpec")
             .field("id", &self.id)
             .field("restart", &self.restart)
-            .field(
-                "restart_counter_reset_after",
-                &self.restart_counter_reset_after,
-            )
+            .field("reset_after", &self.reset_after)
             .finish()
     }
 }
@@ -113,8 +161,8 @@ pub struct RestartLog {
 
 pub trait CoreSupervisorOptions<Strategy> {
     fn max_restarts(&self) -> usize;
-    fn max_seconds(&self) -> usize;
-    fn restart_counter_reset_after(&self) -> Option<u64>;
+    fn max_window(&self) -> Duration;
+    fn reset_after(&self) -> Option<Duration>;
     fn strategy(&self) -> Strategy;
 }
 
@@ -134,7 +182,7 @@ pub trait SupervisorCore {
     ) -> Self::Message;
 
     /// Increments the failure count for a given child.  
-    /// Resets the child’s `restart_count` to 0 if the time since last fail >= child’s `restart_counter_reset_after`.
+    /// Resets the child’s `restart_count` to 0 if the time since last fail >= child's `reset_after` duration.
     fn prepare_child_failure(&mut self, child_spec: &ChildSpec) -> Result<(), ActorProcessingErr> {
         let child_id = &child_spec.id;
         let now = Instant::now();
@@ -146,9 +194,8 @@ pub trait SupervisorCore {
                 last_fail_instant: now,
             });
 
-        if let Some(threshold_secs) = child_spec.restart_counter_reset_after {
-            let elapsed = now.duration_since(entry.last_fail_instant).as_secs();
-            if elapsed >= threshold_secs {
+        if let Some(threshold) = child_spec.reset_after {
+            if now.duration_since(entry.last_fail_instant) >= threshold {
                 entry.restart_count = 0;
             }
         }
@@ -202,20 +249,20 @@ pub trait SupervisorCore {
 
     /// Updates meltdown log and checks meltdown thresholds.  
     ///
-    /// - If `restart_counter_reset_after` is set and we’ve been quiet longer than that, we clear the meltdown log.  
-    /// - We add a new entry and drop entries older than `max_seconds`.  
+    /// - If `reset_after` is set and we’ve been quiet longer than that, we clear the meltdown log.  
+    /// - We add a new entry and drop entries older than `max_window`.  
     /// - If `len(restart_log) > max_restarts`, meltdown is triggered.
     fn track_global_restart(&mut self, child_id: &str) -> Result<(), ActorProcessingErr> {
         let now: Instant = Instant::now();
 
         let max_restarts = self.options().max_restarts();
-        let max_seconds = self.options().max_seconds();
-        let reset_after = self.options().restart_counter_reset_after();
+        let max_window = self.options().max_window();
+        let reset_after = self.options().reset_after();
 
         let restart_log = self.restart_log();
 
         if let (Some(thresh), Some(latest)) = (reset_after, restart_log.last()) {
-            if now.duration_since(latest.timestamp).as_secs() >= thresh {
+            if now.duration_since(latest.timestamp) >= thresh {
                 restart_log.clear();
             }
         }
@@ -225,8 +272,7 @@ pub trait SupervisorCore {
             timestamp: now,
         });
 
-        let cutoff = max_seconds as u64;
-        restart_log.retain(|t| now.duration_since(t.timestamp).as_secs() < cutoff);
+        restart_log.retain(|t| now.duration_since(t.timestamp) < max_window);
 
         if restart_log.len() > max_restarts {
             Err(SupervisorError::Meltdown {
@@ -258,14 +304,17 @@ pub trait SupervisorCore {
         };
         let msg = self.restart_msg(child_spec, strategy, myself.clone());
 
-        let delay = child_spec.backoff_fn.as_ref().and_then(|cb| {
-            cb(
-                child_id,
-                restart_count,
-                last_fail_instant,
-                child_spec.restart_counter_reset_after,
-            )
-        });
+        let delay = child_spec
+            .backoff_fn
+            .as_ref()
+            .and_then(|cb: &ChildBackoffFn| {
+                cb.call(
+                    child_id,
+                    restart_count,
+                    last_fail_instant,
+                    child_spec.reset_after,
+                )
+            });
 
         match delay {
             Some(delay) => {

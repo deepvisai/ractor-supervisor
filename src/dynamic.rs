@@ -1,4 +1,4 @@
-use ractor::concurrency::{Instant, JoinHandle};
+use ractor::concurrency::{Duration, Instant, JoinHandle};
 use ractor::{
     call, Actor, ActorCell, ActorName, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr,
     SupervisionEvent,
@@ -14,8 +14,8 @@ use crate::core::{
 pub struct DynamicSupervisorOptions {
     pub max_children: Option<usize>,
     pub max_restarts: usize,
-    pub max_seconds: usize,
-    pub restart_counter_reset_after: Option<u64>,
+    pub max_window: Duration,
+    pub reset_after: Option<Duration>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,12 +49,12 @@ impl CoreSupervisorOptions<()> for DynamicSupervisorOptions {
         self.max_restarts
     }
 
-    fn max_seconds(&self) -> usize {
-        self.max_seconds
+    fn max_window(&self) -> Duration {
+        self.max_window
     }
 
-    fn restart_counter_reset_after(&self) -> Option<u64> {
-        self.restart_counter_reset_after
+    fn reset_after(&self) -> Option<Duration> {
+        self.reset_after
     }
 
     fn strategy(&self) {}
@@ -267,7 +267,9 @@ impl DynamicSupervisor {
         }
 
         // Spawn child
-        let result = (spec.spawn_fn)(myself.get_cell().clone(), spec.id.clone())
+        let result = spec
+            .spawn_fn
+            .call(myself.get_cell().clone(), spec.id.clone())
             .await
             .map_err(|e| SupervisorError::ChildSpawnError {
                 child_id: spec.id.clone(),
@@ -365,7 +367,7 @@ async fn store_final_state(myself: ActorRef<DynamicSupervisorMsg>, state: &Dynam
 mod tests {
     use super::*;
     use crate::core::{ChildBackoffFn, ChildSpec, Restart};
-    use futures_util::FutureExt;
+    use crate::SpawnFn;
     use ractor::concurrency::{sleep, Duration, Instant};
     use ractor::{call_t, Actor, ActorCell, ActorRef, ActorStatus};
     use serial_test::serial;
@@ -380,28 +382,21 @@ mod tests {
 
     async fn before_each() {
         // Clear the final supervisor state map (test usage)
-        match super::SUPERVISOR_FINAL.get() {
-            None => {}
-            Some(map) => {
-                let mut map = map.lock().await;
-                map.clear();
-            }
+        if let Some(map) = SUPERVISOR_FINAL.get() {
+            let mut map = map.lock().await;
+            map.clear();
         }
         // Clear our actor call counts
-        match ACTOR_CALL_COUNT.get() {
-            None => {}
-            Some(map) => {
-                let mut map = map.lock().await;
-                map.clear();
-            }
+        if let Some(map) = ACTOR_CALL_COUNT.get() {
+            let mut map = map.lock().await;
+            map.clear();
         }
-
         sleep(Duration::from_millis(10)).await;
     }
 
     async fn increment_actor_count(child_id: &str) {
         let mut map = ACTOR_CALL_COUNT
-            .get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+            .get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
             .lock()
             .await;
         *map.entry(child_id.to_string()).or_default() += 1;
@@ -409,12 +404,11 @@ mod tests {
 
     /// Utility to read the final state of a named supervisor after it stops.
     async fn read_final_supervisor_state(sup_name: &str) -> DynamicSupervisorState {
-        let map = super::SUPERVISOR_FINAL
+        let map = SUPERVISOR_FINAL
             .get()
             .expect("SUPERVISOR_FINAL not initialized!")
             .lock()
             .await;
-
         map.get(sup_name)
             .cloned()
             .unwrap_or_else(|| panic!("No final state for supervisor '{sup_name}'"))
@@ -426,7 +420,6 @@ mod tests {
             .expect("ACTOR_CALL_COUNT not initialized!")
             .lock()
             .await;
-
         *map.get(child_id)
             .unwrap_or_else(|| panic!("No actor call count for child '{child_id}'"))
     }
@@ -470,7 +463,6 @@ mod tests {
         ) -> Result<Self::State, ractor::ActorProcessingErr> {
             // Track how many times this particular child-id was started
             increment_actor_count(myself.get_name().unwrap().as_str()).await;
-
             match arg {
                 ChildBehavior::DelayedFail { ms } => {
                     myself.send_after(Duration::from_millis(ms), || ());
@@ -478,12 +470,8 @@ mod tests {
                 ChildBehavior::DelayedNormal { ms } => {
                     myself.send_after(Duration::from_millis(ms), || ());
                 }
-                ChildBehavior::ImmediateFail => {
-                    panic!("Immediate fail => ActorFailed");
-                }
-                ChildBehavior::ImmediateNormal => {
-                    myself.stop(None);
-                }
+                ChildBehavior::ImmediateFail => panic!("Immediate fail => ActorFailed"),
+                ChildBehavior::ImmediateNormal => myself.stop(None),
                 ChildBehavior::CountedFails { delay_ms, .. } => {
                     myself.send_after(Duration::from_millis(delay_ms), || ());
                 }
@@ -502,18 +490,10 @@ mod tests {
             state: &mut Self::State,
         ) -> Result<(), ractor::ActorProcessingErr> {
             match state {
-                ChildBehavior::DelayedFail { .. } => {
-                    panic!("Delayed fail => ActorFailed");
-                }
-                ChildBehavior::DelayedNormal { .. } => {
-                    myself.stop(None);
-                }
-                ChildBehavior::ImmediateFail => {
-                    panic!("ImmediateFail => ActorFailed");
-                }
-                ChildBehavior::ImmediateNormal => {
-                    myself.stop(None);
-                }
+                ChildBehavior::DelayedFail { .. } => panic!("Delayed fail => ActorFailed"),
+                ChildBehavior::DelayedNormal { .. } => myself.stop(None),
+                ChildBehavior::ImmediateFail => panic!("ImmediateFail => ActorFailed"),
+                ChildBehavior::ImmediateNormal => myself.stop(None),
                 ChildBehavior::CountedFails {
                     fail_count,
                     current,
@@ -581,11 +561,11 @@ mod tests {
         ChildSpec {
             id: id.to_string(),
             restart,
-            spawn_fn: Arc::new(move |sup_cell, child_id| {
-                spawn_test_child(sup_cell, child_id, behavior.clone()).boxed()
+            spawn_fn: SpawnFn::new(move |sup_cell, child_id| {
+                spawn_test_child(sup_cell, child_id, behavior.clone())
             }),
             backoff_fn: None, // by default no per-child backoff
-            restart_counter_reset_after: None,
+            reset_after: None,
         }
     }
 
@@ -602,17 +582,14 @@ mod tests {
     #[serial]
     async fn test_transient_child_normal_exit() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         let options = DynamicSupervisorOptions {
             max_children: None,
             max_restarts: 5,
-            max_seconds: 5,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(5),
+            reset_after: None,
         };
-
         let (sup_ref, sup_handle) =
             DynamicSupervisor::spawn("test_dynamic_normal_exit".into(), options).await?;
-
         // Spawn a child that will exit after 200ms
         let child_spec = make_child_spec(
             "normal-dynamic",
@@ -620,10 +597,8 @@ mod tests {
             ChildBehavior::DelayedNormal { ms: 200 },
         );
         DynamicSupervisor::spawn_child(sup_ref.clone(), child_spec).await?;
-
         // Let the child exit
         sleep(Duration::from_millis(300)).await;
-
         // Confirm child is gone; no meltdown triggered
         let sup_state = inspect_supervisor(&sup_ref).await;
         assert_eq!(
@@ -631,7 +606,6 @@ mod tests {
             ActorStatus::Running,
             "Supervisor still running"
         );
-
         assert!(
             sup_state.active_children.is_empty(),
             "Child should have exited normally"
@@ -641,11 +615,9 @@ mod tests {
             "No children running"
         );
         assert!(sup_state.restart_log.is_empty(), "No restarts expected");
-
         // Stop supervisor
         sup_ref.stop(None);
         let _ = sup_handle.await;
-
         // Validate final state
         let final_st = read_final_supervisor_state("test_dynamic_normal_exit").await;
         assert!(final_st.restart_log.is_empty());
@@ -654,7 +626,6 @@ mod tests {
             1,
             "Spawned exactly once"
         );
-
         Ok(())
     }
 
@@ -664,36 +635,29 @@ mod tests {
     #[serial]
     async fn test_permanent_child_meltdown() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         let options = DynamicSupervisorOptions {
             // meltdown after 1 (the second) fail in <= 2s
             max_children: None,
             max_restarts: 1,
-            max_seconds: 2,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(2),
+            reset_after: None,
         };
-
         let (sup_ref, sup_handle) =
             DynamicSupervisor::spawn("test_permanent_child_meltdown".into(), options).await?;
-
         let fail_child_spec = make_child_spec(
             "fail-child",
             Restart::Permanent,
             ChildBehavior::ImmediateFail,
         );
-
         DynamicSupervisor::spawn_child(sup_ref.clone(), fail_child_spec).await?;
-
         let _ = sup_handle.await;
         assert_eq!(
             sup_ref.get_status(),
             ActorStatus::Stopped,
             "Supervisor meltdown expected"
         );
-
         // Final checks
         let final_state = read_final_supervisor_state("test_permanent_child_meltdown").await;
-
         // meltdown => 2 fails in the log
         assert!(
             final_state.restart_log.len() == 2,
@@ -701,7 +665,6 @@ mod tests {
         );
         // The child was started twice
         assert_eq!(read_actor_call_count("fail-child").await, 2);
-
         Ok(())
     }
 
@@ -711,28 +674,23 @@ mod tests {
     #[serial]
     async fn test_temporary_child_fail_no_restart() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         let options = DynamicSupervisorOptions {
             max_children: None,
             max_restarts: 10,
-            max_seconds: 10,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(10),
+            reset_after: None,
         };
-
         let (sup_ref, sup_handle) =
             DynamicSupervisor::spawn("test_temporary_child_fail_no_restart".into(), options)
                 .await?;
-
         let temp_child = make_child_spec(
             "temp-fail",
             Restart::Temporary,
             ChildBehavior::DelayedFail { ms: 200 },
         );
         DynamicSupervisor::spawn_child(sup_ref.clone(), temp_child).await?;
-
         // Let the child fail
         sleep(Duration::from_millis(400)).await;
-
         // Supervisor still running, child gone
         assert_eq!(sup_ref.get_status(), ActorStatus::Running);
         let sup_state = inspect_supervisor(&sup_ref).await;
@@ -744,46 +702,37 @@ mod tests {
             get_running_children(&sup_ref).is_empty(),
             "No children running"
         );
-
         sup_ref.stop(None);
         let _ = sup_handle.await;
-
         let final_st = read_final_supervisor_state("test_temporary_child_fail_no_restart").await;
         assert_eq!(final_st.restart_log.len(), 0, "No restarts occurred");
         assert_eq!(read_actor_call_count("temp-fail").await, 1);
-
         Ok(())
     }
 
-    /// Ensure that if a meltdown threshold is set (max_restarts + max_seconds),
+    /// Ensure that if a meltdown threshold is set (max_restarts + max_window),
     /// multiple quick fails in that window cause meltdown.
     #[ractor::concurrency::test]
     #[serial]
     async fn test_max_restarts_in_time_window() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         // meltdown on 3 fails in <=1s => max_restarts=2 => meltdown on the 3rd
         let options = DynamicSupervisorOptions {
             max_children: None,
             max_restarts: 2,
-            max_seconds: 1,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(1),
+            reset_after: None,
         };
-
         let (sup_ref, sup_handle) =
             DynamicSupervisor::spawn("test_dynamic_max_restarts_in_time_window".into(), options)
                 .await?;
-
         let child_spec =
             make_child_spec("fastfail", Restart::Permanent, ChildBehavior::ImmediateFail);
-
         // This child fails immediately on start => triggers multiple restarts quickly
         DynamicSupervisor::spawn_child(sup_ref.clone(), child_spec).await?;
-
         // Wait for meltdown
         let _ = sup_handle.await;
         assert_eq!(sup_ref.get_status(), ActorStatus::Stopped);
-
         let final_state =
             read_final_supervisor_state("test_dynamic_max_restarts_in_time_window").await;
         assert_eq!(
@@ -792,32 +741,28 @@ mod tests {
             "Should see 3 fails in meltdown window"
         );
         assert_eq!(read_actor_call_count("fastfail").await, 3);
-
         Ok(())
     }
 
-    /// Tests the optional `restart_counter_reset_after` at the **supervisor** level,
+    /// Tests the optional `reset_after` at the **supervisor** level,
     /// ensuring that if there's a quiet period, the meltdown log is cleared.
     #[ractor::concurrency::test]
     #[serial]
     async fn test_supervisor_restart_counter_reset_after() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         // meltdown on 3 fails in <= 10s (max_restarts=2 => meltdown on #3)
         // but if quiet >=2s => meltdown log is cleared
         let options = DynamicSupervisorOptions {
             max_children: None,
             max_restarts: 2,
-            max_seconds: 10,
-            restart_counter_reset_after: Some(2),
+            max_window: Duration::from_secs(10),
+            reset_after: Some(Duration::from_secs(2)),
         };
-
         let (sup_ref, sup_handle) = DynamicSupervisor::spawn(
             "test_supervisor_restart_counter_reset_after".into(),
             options,
         )
         .await?;
-
         // We'll use a child that fails 2 times quickly, then is quiet 3s, then fails again
         // The meltdown log should get cleared after 3s => final fail sees meltdown log=1 => no meltdown
         let behavior = ChildBehavior::FailWaitFail {
@@ -827,17 +772,13 @@ mod tests {
             current: Arc::new(AtomicU64::new(0)),
         };
         let child_spec = make_child_spec("reset-test", Restart::Permanent, behavior);
-
         DynamicSupervisor::spawn_child(sup_ref.clone(), child_spec).await?;
-
         // Let the child do its thing: 2 fails quickly => then quiet => final fail
         sleep(Duration::from_secs(4)).await;
-
         // The supervisor should still be alive
         assert_eq!(sup_ref.get_status(), ActorStatus::Running);
         sup_ref.stop(None);
         let _ = sup_handle.await;
-
         // meltdown log is reset after the quiet period => only the final fail is logged
         let final_st =
             read_final_supervisor_state("test_supervisor_restart_counter_reset_after").await;
@@ -848,32 +789,28 @@ mod tests {
         );
         // The child started 4 times total
         assert_eq!(read_actor_call_count("reset-test").await, 4);
-
         Ok(())
     }
 
-    /// Tests the child-level `restart_counter_reset_after`, ensuring that a quiet period
+    /// Tests the child-level `reset_after`, ensuring that a quiet period
     /// resets that **child's** fail count. The result is no meltdown if a subsequent fail
     /// happens after the quiet window.
     #[ractor::concurrency::test]
     #[serial]
     async fn test_child_level_restart_counter_reset_after() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         // We'll set a large meltdown threshold so we don't meltdown unless the child's restarts remain consecutive.
         let options = DynamicSupervisorOptions {
             max_children: None,
             max_restarts: 5,
-            max_seconds: 30,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(30),
+            reset_after: None,
         };
-
         let (sup_ref, sup_handle) = DynamicSupervisor::spawn(
             "test_dynamic_child_level_restart_counter_reset_after".into(),
             options,
         )
         .await?;
-
         // The child fails 2 times quickly => quiet 3s => final fail => from that child's perspective, it starts from 0 again
         let behavior = ChildBehavior::FailWaitFail {
             initial_fails: 2,
@@ -881,32 +818,24 @@ mod tests {
             final_fails: 1,
             current: Arc::new(AtomicU64::new(0)),
         };
-
         let mut child_spec = make_child_spec("child-reset", Restart::Permanent, behavior);
         // **Per-child** reset
-        child_spec.restart_counter_reset_after = Some(2);
-
+        child_spec.reset_after = Some(Duration::from_secs(2));
         DynamicSupervisor::spawn_child(sup_ref.clone(), child_spec).await?;
-
         // Wait for child to do the fails & quiet period
         sleep(Duration::from_secs(5)).await;
-
         // No meltdown => supervisor still up
         assert_eq!(sup_ref.get_status(), ActorStatus::Running);
-
         sup_ref.stop(None);
         let _ = sup_handle.await;
-
         let final_st =
             read_final_supervisor_state("test_dynamic_child_level_restart_counter_reset_after")
                 .await;
         let cfs = final_st.child_failure_state.get("child-reset").unwrap();
         // The final fail saw a reset => the child's restart_count ended up at 1
         assert_eq!(cfs.restart_count, 1);
-
         // total spawns = 4
         assert_eq!(read_actor_call_count("child-reset").await, 4);
-
         Ok(())
     }
 
@@ -915,38 +844,32 @@ mod tests {
     #[serial]
     async fn test_child_level_backoff_fn_delays_restart() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         // meltdown on 2nd fail => max_restarts=1 => meltdown on fail #2
         // but we do a 1-second child-level backoff for the second spawn
         let options = DynamicSupervisorOptions {
             max_children: None,
             max_restarts: 1,
-            max_seconds: 10,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(10),
+            reset_after: None,
         };
-
         let (sup_ref, sup_handle) =
             DynamicSupervisor::spawn("test_dynamic_child_backoff".to_string(), options).await?;
-
         // Our backoff function that returns Some(1s) after the first restart
-        let backoff_fn: ChildBackoffFn = Arc::new(|_id, count, _last, _child_reset| {
+        let backoff_fn: ChildBackoffFn = ChildBackoffFn::new(|_id, count, _last, _child_reset| {
             if count <= 1 {
                 None
             } else {
                 Some(Duration::from_secs(1))
             }
         });
-
         let mut child_spec = make_child_spec(
             "backoff-child",
             Restart::Permanent,
             ChildBehavior::ImmediateFail,
         );
         child_spec.backoff_fn = Some(backoff_fn);
-
         let start_instant = Instant::now();
         DynamicSupervisor::spawn_child(sup_ref.clone(), child_spec).await?;
-
         // Wait for meltdown
         let _ = sup_handle.await;
         let elapsed = start_instant.elapsed();
@@ -955,11 +878,9 @@ mod tests {
             elapsed >= Duration::from_secs(1),
             "Expected at least 1s of backoff before meltdown"
         );
-
         let final_st = read_final_supervisor_state("test_dynamic_child_backoff").await;
         assert_eq!(final_st.restart_log.len(), 2, "two fails => meltdown on #2");
         assert_eq!(read_actor_call_count("backoff-child").await, 2);
-
         Ok(())
     }
 
@@ -969,17 +890,14 @@ mod tests {
     #[serial]
     async fn test_exceed_max_children() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         let options = DynamicSupervisorOptions {
             max_children: Some(1), // only 1 child allowed
             max_restarts: 999,
-            max_seconds: 999,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(999),
+            reset_after: None,
         };
-
         let (sup_ref, sup_handle) =
             DynamicSupervisor::spawn("test_exceed_max_children".to_string(), options).await?;
-
         let spec_1 = make_child_spec(
             "allowed-child",
             Restart::Permanent,
@@ -990,17 +908,14 @@ mod tests {
             Restart::Permanent,
             ChildBehavior::DelayedNormal { ms: 500 },
         );
-
         // first child is fine
         DynamicSupervisor::spawn_child(sup_ref.clone(), spec_1).await?;
-
         // second child => should fail
         let result = DynamicSupervisor::spawn_child(sup_ref.clone(), spec_2).await;
         assert!(
             result.is_err(),
             "Spawning a second child should fail due to max_children=1"
         );
-
         let final_st = read_final_supervisor_state("test_exceed_max_children").await;
         assert_eq!(
             final_st.active_children.len(),
@@ -1011,10 +926,8 @@ mod tests {
             get_running_children(&sup_ref).len() == 1,
             "Only one child running"
         );
-
         sup_ref.stop(None);
         let _ = sup_handle.await;
-
         Ok(())
     }
 
@@ -1023,23 +936,20 @@ mod tests {
     #[serial]
     async fn test_terminate_child() -> Result<(), ActorProcessingErr> {
         before_each().await;
-
         let options = DynamicSupervisorOptions {
             max_children: None,
             max_restarts: 10,
-            max_seconds: 10,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(10),
+            reset_after: None,
         };
         let (sup_ref, sup_handle) =
             DynamicSupervisor::spawn("test_terminate_child".into(), options).await?;
-
         let child_spec = make_child_spec(
             "kill-me",
             Restart::Permanent,
             ChildBehavior::DelayedNormal { ms: 9999 },
         );
         DynamicSupervisor::spawn_child(sup_ref.clone(), child_spec).await?;
-
         // Confirm child is present
         let st_before = inspect_supervisor(&sup_ref).await;
         assert!(st_before.active_children.contains_key("kill-me"));
@@ -1047,10 +957,8 @@ mod tests {
             get_running_children(&sup_ref).len() == 1,
             "Child is running"
         );
-
         // Terminate
         DynamicSupervisor::terminate_child(sup_ref.clone(), "kill-me".to_string()).await?;
-
         // Check that child is gone, no meltdown
         let st_after = inspect_supervisor(&sup_ref).await;
         assert!(!st_after.active_children.contains_key("kill-me"));
@@ -1059,17 +967,14 @@ mod tests {
             "No child is running"
         );
         assert_eq!(sup_ref.get_status(), ActorStatus::Running);
-
         // Stop the supervisor
         sup_ref.stop(None);
         let _ = sup_handle.await;
-
         let final_st = read_final_supervisor_state("test_terminate_child").await;
         // No restarts
         assert!(final_st.restart_log.is_empty());
         // Only started once
         assert_eq!(read_actor_call_count("kill-me").await, 1);
-
         Ok(())
     }
 }

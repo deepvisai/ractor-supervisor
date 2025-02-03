@@ -23,7 +23,7 @@
 //!
 //! ```rust
 //! use ractor_supervisor::*;
-//! use std::time::Duration;
+//! use ractor::concurrency::Duration;
 //! use tokio::time::sleep;
 //!
 //! #[tokio::main]
@@ -32,8 +32,8 @@
 //!     let options = TaskSupervisorOptions {
 //!         max_children: Some(10),
 //!         max_restarts: 3,
-//!         max_seconds: 10,
-//!         restart_counter_reset_after: Some(30),
+//!         max_window: Duration::from_secs(10),
+//!         reset_after: Some(Duration::from_secs(30)),
 //!     };
 //!
 //!     // Spawn the supervisor
@@ -53,7 +53,7 @@
 //!             if rand::random() {
 //!                 panic!("Random failure!");
 //!             }
-//! 
+//!
 //!             Ok(())
 //!         },
 //!         TaskOptions::new()
@@ -90,7 +90,7 @@
 //!    - The supervisor's meltdown settings
 //!    - Any configured backoff delays
 
-use futures_util::FutureExt;
+use ractor::concurrency::Duration;
 use ractor::concurrency::JoinHandle;
 use ractor::{Actor, ActorCell, ActorName, ActorProcessingErr, ActorRef, SpawnErr};
 use std::future::Future;
@@ -101,6 +101,7 @@ use uuid::Uuid;
 use crate::core::ChildSpec;
 use crate::{
     ChildBackoffFn, DynamicSupervisor, DynamicSupervisorMsg, DynamicSupervisorOptions, Restart,
+    SpawnFn,
 };
 
 /// Actor that wraps and executes an async task.
@@ -160,11 +161,14 @@ pub type TaskSupervisorOptions = DynamicSupervisorOptions;
 
 pub struct TaskSupervisor;
 
+/// Options for configuring a task to be supervised.
 pub struct TaskOptions {
     pub name: ActorName,
     pub restart: Restart,
     pub backoff_fn: Option<ChildBackoffFn>,
-    pub restart_counter_reset_after: Option<u64>,
+    /// Per-task "reset" duration: if a task has not failed for the given period,
+    /// its failure count is reset.
+    pub reset_after: Option<Duration>,
 }
 
 impl Default for TaskOptions {
@@ -173,7 +177,7 @@ impl Default for TaskOptions {
             name: Uuid::new_v4().to_string(),
             restart: Restart::Temporary,
             backoff_fn: None,
-            restart_counter_reset_after: None,
+            reset_after: None,
         }
     }
 }
@@ -198,8 +202,9 @@ impl TaskOptions {
         self
     }
 
-    pub fn restart_counter_reset_after(mut self, seconds: u64) -> Self {
-        self.restart_counter_reset_after = Some(seconds);
+    /// Set the per-task reset duration.
+    pub fn reset_after(mut self, duration: Duration) -> Self {
+        self.reset_after = Some(duration);
         self
     }
 }
@@ -234,13 +239,13 @@ impl TaskSupervisor {
 
         let spec = ChildSpec {
             id: child_id.clone(),
-            spawn_fn: Arc::new({
+            spawn_fn: SpawnFn::new({
                 let task_wrapper = task_wrapper.clone();
-                move |sup, id| spawn_task_actor(id, task_wrapper.clone(), sup).boxed()
+                move |sup, id| spawn_task_actor(id, task_wrapper.clone(), sup)
             }),
             restart: options.restart,
             backoff_fn: options.backoff_fn,
-            restart_counter_reset_after: options.restart_counter_reset_after,
+            reset_after: options.reset_after,
         };
 
         DynamicSupervisor::spawn_child(supervisor, spec).await?;
@@ -257,7 +262,6 @@ impl TaskSupervisor {
 
 async fn spawn_task_actor(id: String, task: TaskFn, sup: ActorCell) -> Result<ActorCell, SpawnErr> {
     let (child_ref, _join) = DynamicSupervisor::spawn_linked(id, TaskActor, task, sup).await?;
-
     Ok(child_ref.get_cell())
 }
 
@@ -286,8 +290,8 @@ mod tests {
             TaskSupervisorOptions {
                 max_children: Some(10),
                 max_restarts: 3,
-                max_seconds: 1,
-                restart_counter_reset_after: Some(1000),
+                max_window: Duration::from_secs(10),
+                reset_after: Some(Duration::from_secs(30)),
             },
         )
         .await
@@ -298,11 +302,9 @@ mod tests {
         let task_id = TaskSupervisor::spawn_task(
             supervisor.clone(),
             move || {
-                // Clone again for each restart
                 let tx = tx.clone();
                 async move {
                     tx.send(()).await.unwrap();
-
                     Ok(())
                 }
             },
@@ -328,11 +330,11 @@ mod tests {
 
         let (supervisor, handle) = TaskSupervisor::spawn(
             "test-supervisor".into(),
-            DynamicSupervisorOptions {
+            TaskSupervisorOptions {
                 max_children: Some(10),
                 max_restarts: 3,
-                max_seconds: 1,
-                restart_counter_reset_after: Some(1000),
+                max_window: Duration::from_secs(1),
+                reset_after: Some(Duration::from_secs(1000)),
             },
         )
         .await
@@ -342,7 +344,6 @@ mod tests {
         let task_id = TaskSupervisor::spawn_task(
             supervisor.clone(),
             move || {
-                // Clone again for each restart
                 let tx = tx.clone();
                 async move {
                     sleep(Duration::from_secs(10)).await;
@@ -375,11 +376,11 @@ mod tests {
 
         let (supervisor, handle) = TaskSupervisor::spawn(
             "test-supervisor".into(),
-            DynamicSupervisorOptions {
+            TaskSupervisorOptions {
                 max_children: Some(10),
                 max_restarts: 3,
-                max_seconds: 1,
-                restart_counter_reset_after: Some(1000),
+                max_window: Duration::from_secs(1),
+                reset_after: Some(Duration::from_secs(1000)),
             },
         )
         .await
@@ -389,7 +390,6 @@ mod tests {
         let _task_id = TaskSupervisor::spawn_task(
             supervisor.clone(),
             move || {
-                // Clone again for each restart
                 let tx = tx.clone();
                 async move {
                     tx.send(()).await.unwrap();

@@ -54,11 +54,11 @@ Example: If spawning a child fails during pre_start, it will count as a restart 
 - **Temporary**: Never restart, regardless of exit reason.
 
 ### Meltdown Logic
-- **`max_restarts`** and **`max_seconds`**: The "time window" for meltdown counting. If more than `max_restarts` occur within `max_seconds`, the supervisor shuts down abnormally (meltdown).
-- **`restart_counter_reset_after`**: If the supervisor sees no failures for this many seconds, it clears its meltdown log and effectively "resets" the meltdown counters.
+- **`max_restarts`** and **`max_window`**: The "time window" for meltdown counting, expressed as a `Duration`. If more than `max_restarts` occur within `max_window`, the supervisor shuts down abnormally (meltdown).
+- **`reset_after`**: If the supervisor sees no failures for the specified duration, it clears its meltdown log and effectively resets the meltdown counters.
 
 ### Child-Level Features
-- **`restart_counter_reset_after`** (per child): If a specific child remains up for that many seconds, its own failure count is reset to zero on the next failure.
+- **`reset_after`** (per child): If a specific child remains up for the given duration, its own failure count is reset to zero on the next failure.
 - **`backoff_fn`**: An optional function to delay a child's restart. For instance, you might implement exponential backoff to prevent immediate thrashing restarts.
 
 ## Important Requirements
@@ -72,7 +72,6 @@ Example: If spawning a child fails during pre_start, it will count as a restart 
    - `Supervisor::spawn_linked` or `Supervisor::spawn` for static supervisors
    - `DynamicSupervisor::spawn_linked` or `DynamicSupervisor::spawn` for dynamic supervisors
    - Do NOT use the generic `Actor::spawn_linked` directly
-
 
 ## Multi-Level Supervision Trees
 
@@ -97,7 +96,7 @@ Here's a complete example using a static supervisor:
 ```rust
 use ractor::Actor;
 use ractor_supervisor::*;
-use std::{time::Duration, sync::Arc};
+use ractor::concurrency::Duration;
 use tokio::time::Instant;
 use futures_util::FutureExt;
 
@@ -139,9 +138,9 @@ async fn spawn_my_worker(
     // We name the child actor using `child_spec.id` (though naming is optional).
     let (child_ref, _join) = Supervisor::spawn_linked(
         Some(child_id), // actor name
-        MyWorker,                    // actor instance
-        (),                          // arguments
-        supervisor_cell             // link to the supervisor
+        MyWorker,       // actor instance
+        (),             // arguments
+        supervisor_cell // link to the supervisor
     ).await?;
     Ok(child_ref.get_cell())
 }
@@ -166,19 +165,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let child_spec = ChildSpec {
         id: "myworker".into(),  // Unique identifier for meltdown logs and debugging.
         restart: Restart::Transient, // Only restart if the child fails abnormally.
-        spawn_fn: Arc::new(|cell, id| spawn_my_worker(cell, id).boxed()),
+        spawn_fn: SpawnFn::new(|cell, id| spawn_my_worker(cell, id).boxed()),
         backoff_fn: Some(my_backoff), // Apply our custom exponential backoff on restarts.
-        // If the child remains up for 60s, its individual failure counter resets to 0 next time it fails.
-        restart_counter_reset_after: Some(60),
+        // If the child remains up for 60s, its individual failure counter resets on the next failure.
+        reset_after: Some(Duration::from_secs(60)),
     };
 
-    // Supervisor-level meltdown configuration. If more than 5 restarts occur within 10s, meltdown is triggered.
+    // Supervisor-level meltdown configuration. If more than 5 restarts occur within a 10s window, meltdown is triggered.
     // Also, if we stay quiet for 30s (no restarts), the meltdown log resets.
     let options = SupervisorOptions {
-        strategy: SupervisorStrategy::OneForOne,  // If one child fails, only that child is restarted.
-        max_restarts: 5,               // Permit up to 5 restarts in the meltdown window.
-        max_seconds: 10,               // The meltdown window (in seconds).
-        restart_counter_reset_after: Some(30), // If no failures for 30s, meltdown log is cleared.
+        strategy: SupervisorStrategy::OneForOne,         // If one child fails, only that child is restarted.
+        max_restarts: 5,                                   // Permit up to 5 restarts in the meltdown window.
+        max_window: Duration::from_secs(10),               // The meltdown window.
+        reset_after: Some(Duration::from_secs(30)),        // If no failures for 30s, meltdown log is cleared.
     };
 
     // Group all child specs and meltdown options together:

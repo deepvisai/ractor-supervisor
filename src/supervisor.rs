@@ -2,13 +2,12 @@ use crate::core::{
     ChildFailureState, ChildSpec, CoreSupervisorOptions, RestartLog, SupervisorCore,
     SupervisorError,
 };
-use ractor::concurrency::{sleep, JoinHandle};
+use ractor::concurrency::{sleep, Duration, JoinHandle};
 use ractor::{
     Actor, ActorCell, ActorName, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr,
     SupervisionEvent,
 };
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// The supervision strategy for this supervisor’s children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,22 +22,40 @@ pub enum SupervisorStrategy {
 
 /// Supervisor-level meltdown policy.
 ///
-/// - If more than `max_restarts` occur within `max_seconds`, meltdown occurs (supervisor stops abnormally).
-/// - If `restart_counter_reset_after` is set, we clear the meltdown log if no restarts occur in that span.
+/// - If more than `max_restarts` occur within `max_window`, meltdown occurs (supervisor stops abnormally).
+/// - If `reset_after` is set, we clear the meltdown log if no restarts occur in that span.
 ///
 /// # Timing
-/// - `max_seconds`: Meltdown tracking window duration in **seconds**  
-/// - `restart_counter_reset_after`: Supervisor-level reset duration in **seconds**
+/// - `max_window`: Meltdown tracking window duration  
+/// - `reset_after`: Supervisor-level reset duration
 #[derive(Clone)]
 pub struct SupervisorOptions {
     /// One of OneForOne, OneForAll, or RestForOne
     pub strategy: SupervisorStrategy,
     /// The meltdown threshold for restarts.
     pub max_restarts: usize,
-    /// The meltdown time window in seconds.
-    pub max_seconds: usize,
-    /// Optional: if no restarts for this many seconds, we clear meltdown log.
-    pub restart_counter_reset_after: Option<u64>,
+    /// The meltdown time window.
+    pub max_window: Duration,
+    /// Optional: if no restarts occur for this duration, we clear the meltdown log.
+    pub reset_after: Option<Duration>,
+}
+
+impl CoreSupervisorOptions<SupervisorStrategy> for SupervisorOptions {
+    fn max_restarts(&self) -> usize {
+        self.max_restarts
+    }
+
+    fn max_window(&self) -> Duration {
+        self.max_window
+    }
+
+    fn reset_after(&self) -> Option<Duration> {
+        self.reset_after
+    }
+
+    fn strategy(&self) -> SupervisorStrategy {
+        self.strategy
+    }
 }
 
 /// Internal messages that instruct the supervisor to spawn a child, triggered by its meltdown logic.
@@ -79,24 +96,6 @@ pub struct SupervisorState {
 
     /// Supervisor meltdown options.
     pub options: SupervisorOptions,
-}
-
-impl CoreSupervisorOptions<SupervisorStrategy> for SupervisorOptions {
-    fn max_restarts(&self) -> usize {
-        self.max_restarts
-    }
-
-    fn max_seconds(&self) -> usize {
-        self.max_seconds
-    }
-
-    fn restart_counter_reset_after(&self) -> Option<u64> {
-        self.restart_counter_reset_after
-    }
-
-    fn strategy(&self) -> SupervisorStrategy {
-        self.strategy
-    }
 }
 
 impl SupervisorCore for SupervisorState {
@@ -147,7 +146,9 @@ impl SupervisorState {
         child_spec: &ChildSpec,
         myself: ActorRef<SupervisorMsg>,
     ) -> Result<(), ActorProcessingErr> {
-        let result = (child_spec.spawn_fn)(myself.get_cell().clone(), child_spec.id.clone())
+        let result = child_spec
+            .spawn_fn
+            .call(myself.get_cell().clone(), child_spec.id.clone())
             .await
             .map_err(|e| SupervisorError::ChildSpawnError {
                 child_id: child_spec.id.clone(),
@@ -173,7 +174,6 @@ impl SupervisorState {
         for spec in &child_specs {
             self.spawn_child(spec, myself.clone()).await?;
         }
-
         // Restore the child_specs after spawning
         self.child_specs = child_specs;
         Ok(())
@@ -186,13 +186,11 @@ impl SupervisorState {
         myself: ActorRef<SupervisorMsg>,
     ) -> Result<(), ActorProcessingErr> {
         self.track_global_restart(child_id)?;
-
         // Temporarily take ownership of child_specs to avoid holding an immutable borrow
         let child_specs = std::mem::take(&mut self.child_specs);
         if let Some(spec) = child_specs.iter().find(|s| s.id == child_id) {
             self.spawn_child(spec, myself.clone()).await?;
         }
-
         // Restore the child_specs after spawning
         self.child_specs = child_specs;
         Ok(())
@@ -205,16 +203,13 @@ impl SupervisorState {
         myself: ActorRef<SupervisorMsg>,
     ) -> Result<(), ActorProcessingErr> {
         self.track_global_restart(child_id)?;
-
         // Kill all children. Must unlink to prevent confusion with them receiving further messages.
         for cell in myself.get_children() {
             cell.unlink(myself.get_cell());
             cell.kill();
         }
-
         // A short delay to allow the old children to fully unregister (avoid name collisions).
         sleep(Duration::from_millis(10)).await;
-
         self.spawn_all_children(myself).await?;
         Ok(())
     }
@@ -226,7 +221,6 @@ impl SupervisorState {
         myself: ActorRef<SupervisorMsg>,
     ) -> Result<(), ActorProcessingErr> {
         self.track_global_restart(child_id)?;
-
         // Temporarily take ownership of child_specs to avoid holding an immutable borrow
         let child_specs = std::mem::take(&mut self.child_specs);
         let children = myself.get_children();
@@ -234,7 +228,6 @@ impl SupervisorState {
             .iter()
             .filter_map(|cell| cell.get_name().map(|name| (name, cell)))
             .collect();
-
         if let Some(i) = child_specs.iter().position(|s| s.id == child_id) {
             // Kill children from i..end
             for spec in child_specs.iter().skip(i) {
@@ -243,16 +236,13 @@ impl SupervisorState {
                     cell.kill();
                 }
             }
-
             // Short delay so old names get unregistered
             sleep(Duration::from_millis(10)).await;
-
             // Re-spawn children from i..end
             for spec in child_specs.iter().skip(i) {
                 self.spawn_child(spec, myself.clone()).await?;
             }
         }
-
         // Restore the child_specs after spawning
         self.child_specs = child_specs;
         Ok(())
@@ -364,7 +354,6 @@ impl Actor for Supervisor {
                 let child_id = cell
                     .get_name()
                     .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
-
                 if state.child_specs.iter().any(|s| s.id == child_id) {
                     // This is a child we know about, so we track it
                     state
@@ -433,7 +422,7 @@ async fn store_final_state(myself: ActorRef<SupervisorMsg>, state: &SupervisorSt
 mod tests {
     use super::*;
     use crate::core::{ChildBackoffFn, Restart};
-    use futures_util::FutureExt;
+    use crate::SpawnFn;
     use ractor::concurrency::Instant;
     use ractor::{call_t, Actor, ActorCell, ActorRef, ActorStatus};
     use serial_test::serial;
@@ -447,22 +436,15 @@ mod tests {
 
     async fn before_each() {
         // Clear the final supervisor state map (test usage)
-        match super::SUPERVISOR_FINAL.get() {
-            None => {}
-            Some(map) => {
-                let mut map = map.lock().await;
-                map.clear();
-            }
+        if let Some(map) = SUPERVISOR_FINAL.get() {
+            let mut map = map.lock().await;
+            map.clear();
         }
         // Clear our actor call counts
-        match ACTOR_CALL_COUNT.get() {
-            None => {}
-            Some(map) => {
-                let mut map = map.lock().await;
-                map.clear();
-            }
+        if let Some(map) = ACTOR_CALL_COUNT.get() {
+            let mut map = map.lock().await;
+            map.clear();
         }
-
         sleep(Duration::from_millis(10)).await;
     }
 
@@ -476,12 +458,11 @@ mod tests {
 
     /// Utility to read the final state of a named supervisor after it stops.
     async fn read_final_supervisor_state(sup_name: &str) -> SupervisorState {
-        let map = super::SUPERVISOR_FINAL
+        let map = SUPERVISOR_FINAL
             .get()
             .expect("SUPERVISOR_FINAL not initialized!")
             .lock()
             .await;
-
         map.get(sup_name)
             .cloned()
             .unwrap_or_else(|| panic!("No final state for supervisor '{sup_name}'"))
@@ -493,7 +474,6 @@ mod tests {
             .expect("ACTOR_CALL_COUNT not initialized!")
             .lock()
             .await;
-
         *map.get(child_id)
             .unwrap_or_else(|| panic!("No actor call count for child '{child_id}'"))
     }
@@ -537,7 +517,6 @@ mod tests {
         ) -> Result<Self::State, ractor::ActorProcessingErr> {
             // Track how many times this particular child-id was started
             increment_actor_count(myself.get_name().unwrap().as_str()).await;
-
             match arg {
                 ChildBehavior::DelayedFail { ms } => {
                     myself.send_after(Duration::from_millis(ms), || ());
@@ -645,11 +624,11 @@ mod tests {
         ChildSpec {
             id: id.to_string(),
             restart,
-            spawn_fn: Arc::new(move |sup_cell, child_id| {
-                spawn_test_child(sup_cell, child_id, behavior.clone()).boxed()
+            spawn_fn: SpawnFn::new(move |sup_cell, child_id| {
+                spawn_test_child(sup_cell, child_id, behavior.clone())
             }),
             backoff_fn: None, // by default no per-child backoff
-            restart_counter_reset_after: None,
+            reset_after: None,
         }
     }
 
@@ -667,8 +646,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 1, // meltdown on second fail
-            max_seconds: 2,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(2),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child_spec],
@@ -714,8 +693,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 5,
-            max_seconds: 5,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(5),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child_spec],
@@ -728,7 +707,7 @@ mod tests {
         sleep(Duration::from_millis(150)).await;
         let st1 = call_t!(sup_ref, SupervisorMsg::InspectState, 500).unwrap();
 
-        let mut running = get_running_children(&sup_ref);
+        let running = get_running_children(&sup_ref);
         assert_eq!(running.len(), 1);
         assert_eq!(st1.restart_log.len(), 0);
 
@@ -738,7 +717,7 @@ mod tests {
         let _ = sup_handle.await;
 
         let final_state = read_final_supervisor_state("test_transient_delayed_normal").await;
-        running = get_running_children(&sup_ref);
+        let running = get_running_children(&sup_ref);
         assert!(!running.contains_key("normal-delay"));
         assert_eq!(final_state.restart_log.len(), 0);
 
@@ -762,8 +741,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 10,
-            max_seconds: 10,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(10),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child_spec],
@@ -775,7 +754,7 @@ mod tests {
 
         sleep(Duration::from_millis(100)).await;
         let st1 = call_t!(sup_ref, SupervisorMsg::InspectState, 500).unwrap();
-        let mut running = get_running_children(&sup_ref);
+        let running = get_running_children(&sup_ref);
         assert_eq!(running.len(), 1);
         assert_eq!(st1.restart_log.len(), 0);
 
@@ -787,7 +766,7 @@ mod tests {
         let _ = sup_handle.await;
 
         let final_state = read_final_supervisor_state("test_temporary_delayed_fail").await;
-        running = get_running_children(&sup_ref);
+        let running = get_running_children(&sup_ref);
         assert_eq!(running.len(), 0);
         assert_eq!(final_state.restart_log.len(), 0);
 
@@ -817,8 +796,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForAll,
             max_restarts: 2,
-            max_seconds: 2,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(2),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child1, child2],
@@ -872,8 +851,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::RestForOne,
             max_restarts: 1,
-            max_seconds: 2,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(2),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child_a, child_b, child_c],
@@ -916,8 +895,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 2,
-            max_seconds: 1,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(1),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child_spec],
@@ -958,8 +937,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 0, // meltdown on the very first fail
-            max_seconds: 5,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(5),
+            reset_after: None,
         };
 
         let args = SupervisorArguments {
@@ -992,13 +971,14 @@ mod tests {
 
         // meltdown on 2nd fail => set max_restarts=1 => meltdown on fail #2
         // but we do a 2s child-level backoff for the second spawn
-        let child_backoff: ChildBackoffFn = Arc::new(|_id, count, _last, _child_reset| {
-            if count <= 1 {
-                None
-            } else {
-                Some(Duration::from_secs(2))
-            }
-        });
+        let child_backoff: ChildBackoffFn =
+            ChildBackoffFn::new(|_id, count, _last, _child_reset| {
+                if count <= 1 {
+                    None
+                } else {
+                    Some(Duration::from_secs(2))
+                }
+            });
 
         let mut child_spec =
             make_child_spec("backoff", Restart::Permanent, ChildBehavior::ImmediateFail);
@@ -1007,8 +987,8 @@ mod tests {
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 1, // meltdown on 2nd fail
-            max_seconds: 10,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(10),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child_spec],
@@ -1058,20 +1038,20 @@ mod tests {
         let child_spec = ChildSpec {
             id: "reset-test".to_string(),
             restart: Restart::Permanent,
-            spawn_fn: Arc::new(move |sup_cell, id| {
-                spawn_test_child(sup_cell, id, behavior.clone()).boxed()
+            spawn_fn: SpawnFn::new(move |sup_cell, id| {
+                spawn_test_child(sup_cell, id, behavior.clone())
             }),
             backoff_fn: None,
-            restart_counter_reset_after: None, // no child-level reset
+            reset_after: None, // no child-level reset
         };
 
-        // meltdown if 3 fails happen within max_seconds=10 => max_restarts=2 => meltdown on #3
+        // meltdown if 3 fails happen within max_window=10s => max_restarts=2 => meltdown on #3
         // but if we wait 3s => meltdown log is cleared => final fail => meltdown log=1 => no meltdown
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 2,
-            max_seconds: 10,
-            restart_counter_reset_after: Some(2), // if quiet >=2s => meltdown log cleared
+            max_window: Duration::from_secs(10),
+            reset_after: Some(Duration::from_secs(2)), // if quiet >=2s => meltdown log cleared
         };
 
         let args = SupervisorArguments {
@@ -1123,15 +1103,15 @@ mod tests {
         };
 
         let mut child_spec = make_child_spec("child-reset", Restart::Permanent, behavior);
-        // This time we do a child-level restart_counter_reset_after=2
-        child_spec.restart_counter_reset_after = Some(2);
+        // This time we do a child-level reset_after of 2s
+        child_spec.reset_after = Some(Duration::from_secs(2));
 
         // meltdown won't happen quickly because max_restarts=5
         let options = SupervisorOptions {
             strategy: SupervisorStrategy::OneForOne,
             max_restarts: 5,
-            max_seconds: 30,
-            restart_counter_reset_after: None,
+            max_window: Duration::from_secs(30),
+            reset_after: None,
         };
         let args = SupervisorArguments {
             child_specs: vec![child_spec],
@@ -1190,17 +1170,17 @@ mod tests {
         let sub_sup_spec = ChildSpec {
             id: "sub-sup".to_string(),
             restart: Restart::Permanent,
-            spawn_fn: Arc::new(move |cell, id| {
+            spawn_fn: SpawnFn::new(move |cell, id| {
                 let leaf_child = ChildSpec {
                     id: "leaf-worker".to_string(),
                     restart: Restart::Transient,
-                    spawn_fn: Arc::new(|c, i| {
+                    spawn_fn: SpawnFn::new(|c, i| {
                         // a child that fails once after 300ms
                         let bh = ChildBehavior::DelayedFail { ms: 300 };
-                        spawn_test_child(c, i, bh).boxed()
+                        spawn_test_child(c, i, bh)
                     }),
                     backoff_fn: None,
-                    restart_counter_reset_after: None,
+                    reset_after: None,
                 };
 
                 let sub_sup_args = SupervisorArguments {
@@ -1208,14 +1188,14 @@ mod tests {
                     options: SupervisorOptions {
                         strategy: SupervisorStrategy::OneForOne,
                         max_restarts: 1, // meltdown on 2nd fail
-                        max_seconds: 2,
-                        restart_counter_reset_after: None,
+                        max_window: Duration::from_secs(2),
+                        reset_after: None,
                     },
                 };
-                spawn_subsupervisor(cell, id, sub_sup_args).boxed()
+                spawn_subsupervisor(cell, id, sub_sup_args)
             }),
             backoff_fn: None,
-            restart_counter_reset_after: None,
+            reset_after: None,
         };
 
         // root supervisor that manages sub-sup
@@ -1224,8 +1204,8 @@ mod tests {
             options: SupervisorOptions {
                 strategy: SupervisorStrategy::OneForOne,
                 max_restarts: 1, // meltdown if "sub-sup" fails 2 times
-                max_seconds: 5,
-                restart_counter_reset_after: None,
+                max_window: Duration::from_secs(5),
+                reset_after: None,
             },
         };
 
