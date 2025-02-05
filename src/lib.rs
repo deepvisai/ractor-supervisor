@@ -119,7 +119,7 @@
 //! // A minimal child actor that simply does some work in `handle`.
 //! struct MyWorker;
 //!
-//! #[ractor::async_trait]
+//! #[cfg_attr(feature = "async-trait", ractor::async_trait)]
 //! impl Actor for MyWorker {
 //!     type Msg = ();
 //!     type State = ();

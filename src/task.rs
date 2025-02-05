@@ -130,7 +130,7 @@ impl TaskFn {
     }
 }
 
-#[ractor::async_trait]
+#[cfg_attr(feature = "async-trait", ractor::async_trait)]
 impl Actor for TaskActor {
     type Msg = TaskActorMessage;
     type State = TaskFn;
