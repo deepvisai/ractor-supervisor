@@ -283,7 +283,7 @@ impl Supervisor {
 static SUPERVISOR_FINAL: std::sync::OnceLock<tokio::sync::Mutex<HashMap<String, SupervisorState>>> =
     std::sync::OnceLock::new();
 
-#[ractor::async_trait]
+#[cfg_attr(feature = "async-trait", ractor::async_trait)]
 impl Actor for Supervisor {
     type Msg = SupervisorMsg;
     type State = SupervisorState;
@@ -521,7 +521,7 @@ mod tests {
 
     pub struct TestChild;
 
-    #[ractor::async_trait]
+    #[cfg_attr(feature = "async-trait", ractor::async_trait)]
     impl Actor for TestChild {
         type Msg = ();
         type State = ChildBehavior;

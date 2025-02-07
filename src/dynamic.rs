@@ -93,7 +93,7 @@ impl SupervisorCore for DynamicSupervisorState {
 
 type DynamicSupervisorArguments = DynamicSupervisorOptions;
 
-#[ractor::async_trait]
+#[cfg_attr(feature = "async-trait", ractor::async_trait)]
 impl Actor for DynamicSupervisor {
     type Msg = DynamicSupervisorMsg;
     type State = DynamicSupervisorState;
@@ -453,7 +453,7 @@ mod tests {
 
     pub struct TestChild;
 
-    #[ractor::async_trait]
+    #[cfg_attr(feature = "async-trait", ractor::async_trait)]
     impl Actor for TestChild {
         type Msg = ();
         type State = ChildBehavior;
