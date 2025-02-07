@@ -1,4 +1,4 @@
-use ractor::concurrency::{Duration, Instant, JoinHandle};
+use ractor::concurrency::{sleep, Duration, Instant, JoinHandle};
 use ractor::{
     call, Actor, ActorCell, ActorName, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr,
     SupervisionEvent,
@@ -162,7 +162,7 @@ impl Actor for DynamicSupervisor {
                 let child_id = cell
                     .get_name()
                     .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
-
+                log::info!("Child '{}' started", child_id);
                 if state.active_children.contains_key(&child_id) {
                     // This is a child we know about, so we track it
                     state
@@ -177,7 +177,8 @@ impl Actor for DynamicSupervisor {
             SupervisionEvent::ActorTerminated(cell, ..) => {
                 self.handle_child_restart(cell, false, state, myself)?;
             }
-            SupervisionEvent::ActorFailed(cell, ..) => {
+            SupervisionEvent::ActorFailed(cell, err) => {
+                log::error!("Child '{}' failed: {:?}", cell.get_name().unwrap(), err);
                 self.handle_child_restart(cell, true, state, myself)?;
             }
             SupervisionEvent::ProcessGroupChanged(_group) => {}
@@ -254,6 +255,7 @@ impl DynamicSupervisor {
     ) -> Result<(), ActorProcessingErr> {
         if !first_start {
             state.track_global_restart(&spec.id)?;
+            sleep(Duration::from_millis(10)).await;
         }
 
         // Check max children
@@ -296,7 +298,9 @@ impl DynamicSupervisor {
                         last_fail_instant: Instant::now(),
                     });
             }
-            Err(_) => {
+            Err(err) => {
+                log::error!("Error spawning child '{}': {:?}", spec.id, err);
+
                 state
                     .handle_child_restart(spec, true, myself)
                     .map_err(|e| SupervisorError::ChildSpawnError {

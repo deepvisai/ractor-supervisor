@@ -157,7 +157,8 @@ impl SupervisorState {
 
         // Important: Spawn failures (including pre_start errors)
         // trigger restart logic and meltdown checks
-        if let Err(_err) = result {
+        if let Err(err) = result {
+            log::error!("Error spawning child '{}': {:?}", child_spec.id, err);
             self.handle_child_restart(child_spec, true, myself.clone())?;
         }
 
@@ -363,6 +364,7 @@ impl Actor for Supervisor {
                             restart_count: 0,
                             last_fail_instant: ractor::concurrency::Instant::now(),
                         });
+                    log::info!("Child '{}' started", child_id);
                 }
             }
             SupervisionEvent::ActorTerminated(cell, _final_state, _reason) => {
@@ -376,13 +378,14 @@ impl Actor for Supervisor {
                 }
                 state.child_specs = child_specs;
             }
-            SupervisionEvent::ActorFailed(cell, _reason) => {
+            SupervisionEvent::ActorFailed(cell, reason) => {
                 // Abnormal exit => abnormal=true
                 let child_id = cell
                     .get_name()
                     .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
                 let child_specs = std::mem::take(&mut state.child_specs);
                 if let Some(spec) = child_specs.iter().find(|s| s.id == child_id) {
+                    log::error!("child {} errored with: {}", spec.id, reason);
                     state.handle_child_restart(spec, true, myself.clone())?;
                 }
                 state.child_specs = child_specs;

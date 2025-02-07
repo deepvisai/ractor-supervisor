@@ -241,6 +241,7 @@ pub trait SupervisorCore {
         myself: ActorRef<Self::Message>,
     ) -> Result<(), ActorProcessingErr> {
         if self.handle_child_exit(child_spec, abnormal)? {
+            log::info!("Restarting child '{}, {} exit", child_spec.id, if abnormal { "abnormal" } else { "normal" });
             self.schedule_restart(child_spec, self.options().strategy(), myself.clone())?;
         }
 
