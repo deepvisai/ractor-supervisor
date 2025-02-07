@@ -9,6 +9,7 @@ use crate::core::{
     ChildFailureState, ChildSpec, CoreSupervisorOptions, RestartLog, SupervisorCore,
     SupervisorError,
 };
+use crate::ExitReason;
 
 #[derive(Debug, Clone)]
 pub struct DynamicSupervisorOptions {
@@ -162,7 +163,7 @@ impl Actor for DynamicSupervisor {
                 let child_id = cell
                     .get_name()
                     .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
-                log::info!("Child '{}' started", child_id);
+                log::info!("Started child: {}", child_id);
                 if state.active_children.contains_key(&child_id) {
                     // This is a child we know about, so we track it
                     state
@@ -174,12 +175,11 @@ impl Actor for DynamicSupervisor {
                         });
                 }
             }
-            SupervisionEvent::ActorTerminated(cell, ..) => {
-                self.handle_child_restart(cell, false, state, myself)?;
+            SupervisionEvent::ActorTerminated(cell, _final_state, reason) => {
+                self.handle_child_restart(cell, false, state, myself, &ExitReason::Reason(reason))?;
             }
             SupervisionEvent::ActorFailed(cell, err) => {
-                log::error!("Child '{}' failed: {:?}", cell.get_name().unwrap(), err);
-                self.handle_child_restart(cell, true, state, myself)?;
+                self.handle_child_restart(cell, true, state, myself, &ExitReason::Error(err))?;
             }
             SupervisionEvent::ProcessGroupChanged(_group) => {}
         }
@@ -299,10 +299,8 @@ impl DynamicSupervisor {
                     });
             }
             Err(err) => {
-                log::error!("Error spawning child '{}': {:?}", spec.id, err);
-
                 state
-                    .handle_child_restart(spec, true, myself)
+                    .handle_child_restart(spec, true, myself, &ExitReason::Error(err.into()))
                     .map_err(|e| SupervisorError::ChildSpawnError {
                         child_id: spec.id.clone(),
                         reason: e.to_string(),
@@ -331,6 +329,7 @@ impl DynamicSupervisor {
         abnormal: bool,
         state: &mut DynamicSupervisorState,
         myself: ActorRef<DynamicSupervisorMsg>,
+        reason: &ExitReason,
     ) -> Result<(), ActorProcessingErr> {
         let child_id = cell
             .get_name()
@@ -344,7 +343,7 @@ impl DynamicSupervisor {
                     child_id: child_id.clone(),
                 })?;
 
-        state.handle_child_restart(&child.spec, abnormal, myself)?;
+        state.handle_child_restart(&child.spec, abnormal, myself, reason)?;
 
         Ok(())
     }

@@ -32,9 +32,9 @@ pub enum SupervisorError {
 /// If you return `Some(duration)`, the supervisor will wait that amount of time before actually re-spawning the child.
 /// If `None`, it restarts immediately.
 #[derive(Clone)]
-pub struct ChildBackoffFn(
-    pub Arc<dyn Fn(&str, usize, Instant, Option<Duration>) -> Option<Duration> + Send + Sync>,
-);
+pub struct ChildBackoffFn(pub Arc<BackoffFn>);
+
+type BackoffFn = dyn Fn(&str, usize, Instant, Option<Duration>) -> Option<Duration> + Send + Sync;
 
 impl ChildBackoffFn {
     /// Create a new ChildBackoffFn from a closure.
@@ -166,6 +166,13 @@ pub trait CoreSupervisorOptions<Strategy> {
     fn strategy(&self) -> Strategy;
 }
 
+#[derive(Debug)]
+pub enum ExitReason {
+    Normal,
+    Reason(Option<String>),
+    Error(Box<dyn std::error::Error + Send + Sync>),
+}
+
 pub trait SupervisorCore {
     type Message: Message;
     type Strategy;
@@ -239,9 +246,10 @@ pub trait SupervisorCore {
         child_spec: &ChildSpec,
         abnormal: bool,
         myself: ActorRef<Self::Message>,
+        reason: &ExitReason,
     ) -> Result<(), ActorProcessingErr> {
         if self.handle_child_exit(child_spec, abnormal)? {
-            log::info!("Restarting child '{}, {} exit", child_spec.id, if abnormal { "abnormal" } else { "normal" });
+            log_child_restart(child_spec, abnormal, reason);
             self.schedule_restart(child_spec, self.options().strategy(), myself.clone())?;
         }
 
@@ -327,5 +335,42 @@ pub trait SupervisorCore {
         }
 
         Ok(())
+    }
+}
+
+fn log_child_restart(child_spec: &ChildSpec, abnormal: bool, reason: &ExitReason) {
+    match (abnormal, reason) {
+        (true, ExitReason::Error(err)) => log::error!(
+            "Restarting child: {}, exit: abnormal, error: {:?}",
+            child_spec.id,
+            err
+        ),
+        (false, ExitReason::Error(err)) => log::warn!(
+            "Restarting child: {}, exit: normal, error: {:?}",
+            child_spec.id,
+            err
+        ),
+        (true, ExitReason::Reason(Some(reason))) => log::error!(
+            "Restarting child: {}, exit: abnormal, reason: {}",
+            child_spec.id,
+            reason
+        ),
+        (false, ExitReason::Reason(Some(reason))) => log::warn!(
+            "Restarting child: {}, exit: normal, reason: {}",
+            child_spec.id,
+            reason
+        ),
+        (true, ExitReason::Reason(None)) => {
+            log::error!("Restarting child: {}, exit: abnormal", child_spec.id)
+        }
+        (false, ExitReason::Reason(None)) => {
+            log::warn!("Restarting child: {}, exit: normal", child_spec.id)
+        }
+        (true, ExitReason::Normal) => {
+            log::error!("Restarting child: {}, exit: abnormal", child_spec.id)
+        }
+        (false, ExitReason::Normal) => {
+            log::warn!("Restarting child: {}, exit: normal", child_spec.id)
+        }
     }
 }

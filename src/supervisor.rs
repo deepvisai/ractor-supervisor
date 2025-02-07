@@ -2,6 +2,7 @@ use crate::core::{
     ChildFailureState, ChildSpec, CoreSupervisorOptions, RestartLog, SupervisorCore,
     SupervisorError,
 };
+use crate::ExitReason;
 use ractor::concurrency::{sleep, Duration, JoinHandle};
 use ractor::{
     Actor, ActorCell, ActorName, ActorProcessingErr, ActorRef, RpcReplyPort, SpawnErr,
@@ -158,8 +159,12 @@ impl SupervisorState {
         // Important: Spawn failures (including pre_start errors)
         // trigger restart logic and meltdown checks
         if let Err(err) = result {
-            log::error!("Error spawning child '{}': {:?}", child_spec.id, err);
-            self.handle_child_restart(child_spec, true, myself.clone())?;
+            self.handle_child_restart(
+                child_spec,
+                true,
+                myself.clone(),
+                &ExitReason::Error(err.into()),
+            )?;
         }
 
         Ok(())
@@ -355,6 +360,7 @@ impl Actor for Supervisor {
                 let child_id = cell
                     .get_name()
                     .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
+                log::info!("Started child: {}", child_id);
                 if state.child_specs.iter().any(|s| s.id == child_id) {
                     // This is a child we know about, so we track it
                     state
@@ -364,29 +370,37 @@ impl Actor for Supervisor {
                             restart_count: 0,
                             last_fail_instant: ractor::concurrency::Instant::now(),
                         });
-                    log::info!("Child '{}' started", child_id);
                 }
             }
-            SupervisionEvent::ActorTerminated(cell, _final_state, _reason) => {
+            SupervisionEvent::ActorTerminated(cell, _final_state, reason) => {
                 // Normal exit => abnormal=false
                 let child_id = cell
                     .get_name()
                     .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
                 let child_specs = std::mem::take(&mut state.child_specs);
                 if let Some(spec) = child_specs.iter().find(|s| s.id == child_id) {
-                    state.handle_child_restart(spec, false, myself.clone())?;
+                    state.handle_child_restart(
+                        spec,
+                        false,
+                        myself.clone(),
+                        &ExitReason::Reason(reason),
+                    )?;
                 }
                 state.child_specs = child_specs;
             }
-            SupervisionEvent::ActorFailed(cell, reason) => {
+            SupervisionEvent::ActorFailed(cell, err) => {
                 // Abnormal exit => abnormal=true
                 let child_id = cell
                     .get_name()
                     .ok_or(SupervisorError::ChildNameNotSet { pid: cell.get_id() })?;
                 let child_specs = std::mem::take(&mut state.child_specs);
                 if let Some(spec) = child_specs.iter().find(|s| s.id == child_id) {
-                    log::error!("child {} errored with: {}", spec.id, reason);
-                    state.handle_child_restart(spec, true, myself.clone())?;
+                    state.handle_child_restart(
+                        spec,
+                        true,
+                        myself.clone(),
+                        &ExitReason::Error(err),
+                    )?;
                 }
                 state.child_specs = child_specs;
             }
