@@ -14,7 +14,7 @@ categories = ["asynchronous"]
 rust-version = "1.83.0"
 
 [features]
-default = ["async-trait"]
+default = []
 async-trait = ["ractor/async-trait"]
 
 [dependencies]
